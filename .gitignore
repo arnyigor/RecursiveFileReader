@@ -163,4 +163,6 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-/source_dump.md
+source_dump.md
+/settings.ini
+/output/
