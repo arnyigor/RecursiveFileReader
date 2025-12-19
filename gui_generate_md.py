@@ -3,7 +3,8 @@
 
 """
 Markdown‑генератор исходников с асинхронной генерацией,
-прогресс‑баром и сохранением конфигурации в .env (python-dotenv).
+прогресс‑баром, сохранением конфигурации в .env (python-dotenv)
+и возможностью вручную управлять списком файлов для MD.
 """
 
 from __future__ import annotations
@@ -97,6 +98,7 @@ def collect_source_files(
     for p in root.rglob("*"):
         if not p.is_file() or p.suffix.lower() not in extensions:
             continue
+        # Исключаем любые каталоги из списка exclude_dirs, даже если они находятся в пути.
         if any(part.lower() in exclude_dirs for part in p.parts):
             continue
         if not _is_text_file(p):
@@ -119,18 +121,15 @@ def read_file_contents(file_path: pathlib.Path) -> str:
 async def _generate_async(
         app: "App",
         root: pathlib.Path,
-        exts: Set[str],
-        excludes: Set[str],
+        files: List[pathlib.Path],
         out_name: str,
 ) -> pathlib.Path:
-    loop = asyncio.get_running_loop()
-    # 1. Сбор файлов в отдельном потоке (Python 3.9+)
-    files = await asyncio.to_thread(collect_source_files, root, exts, excludes)
-
+    """
+    Генерация MD‑файла из переданного списка файлов.
+    Прогресс обновляется через API App.
+    """
     if not files:
-        raise FileNotFoundError(
-            f"Не найдены файлы {', '.join(sorted(exts))} в {root}"
-        )
+        raise FileNotFoundError("Список исходных файлов пуст")
 
     out_path = pathlib.Path(out_name).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -145,7 +144,10 @@ async def _generate_async(
                     break
                 content = await asyncio.to_thread(read_file_contents, path)
                 lang_tag = lang_map.get(path.suffix.lower(), "")
-                rel_path = path.relative_to(root)
+                try:
+                    rel_path = path.relative_to(root)
+                except ValueError:
+                    rel_path = path.name
                 f.write(f"### `{rel_path}`\n\n")
                 f.write(f"```{lang_tag}\n{content.rstrip()}\n```\n\n")
 
@@ -157,14 +159,15 @@ async def _generate_async(
     return out_path
 
 
-# ───── GUI ──────────────────────────────────────
+# ───── GUI ──────────────────────
 class App(tk.Tk):
     """Основное окно приложения."""
 
     def __init__(self) -> None:
         super().__init__()
         self.title("Markdown‑генератор исходников")
-        self.geometry("580x380")
+        # Увеличиваем геометрию окна для удобства работы со списком файлов.
+        self.geometry("800x700")
         self.resizable(False, False)
 
         # ───── Виджеты ────────────────────────────────
@@ -175,7 +178,7 @@ class App(tk.Tk):
             pady=(15, 5),
             sticky=tk.W,
         )
-        self.src_entry = tk.Entry(self, width=45)
+        self.src_entry = tk.Entry(self, width=60)
         self.src_entry.grid(row=0, column=1, padx=5, pady=(15, 5))
         tk.Button(
             self, text="Обзор…", command=self.browse_src
@@ -187,7 +190,7 @@ class App(tk.Tk):
             sticky=tk.W,
             padx=10,
         )
-        self.ext_entry = tk.Entry(self, width=45)
+        self.ext_entry = tk.Entry(self, width=60)
         self.ext_entry.grid(row=1, column=1, padx=5)
 
         tk.Label(self, text="Исключать папки (через запятую):").grid(
@@ -196,7 +199,7 @@ class App(tk.Tk):
             sticky=tk.W,
             padx=10,
         )
-        self.exclude_entry = tk.Entry(self, width=35)
+        self.exclude_entry = tk.Entry(self, width=60)
         self.exclude_entry.grid(row=2, column=1, padx=5)
 
         tk.Button(
@@ -209,31 +212,61 @@ class App(tk.Tk):
             sticky=tk.W,
             padx=10,
         )
-        self.out_entry = tk.Entry(self, width=45)
+        self.out_entry = tk.Entry(self, width=60)
         self.out_entry.grid(row=3, column=1, padx=5)
 
-        # Генерация
+        # ───── Список файлов ────────────────────────────────
+        list_frame = ttk.LabelFrame(self, text="Список файлов для MD")
+        list_frame.grid(row=4, column=0, columnspan=3, padx=10, pady=(15, 5), sticky="nsew")
+
+        self.file_listbox = tk.Listbox(
+            list_frame,
+            width=80,
+            height=12,
+            selectmode=tk.MULTIPLE,
+        )
+        self.file_listbox.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=5)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.file_listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 10), pady=5)
+        self.file_listbox.configure(yscrollcommand=scrollbar.set)
+
+        btn_add_file = tk.Button(
+            list_frame,
+            text="Добавить файл…",
+            command=self.add_file,
+        )
+        btn_add_file.grid(row=1, column=0, sticky="w", padx=(10, 5), pady=2)
+
+        btn_remove_sel = tk.Button(
+            list_frame,
+            text="Удалить выбранные",
+            command=self.remove_selected,
+        )
+        btn_remove_sel.grid(row=1, column=0, sticky="e", padx=(5, 10), pady=2)
+
+        # ───── Генерация ────────────────────────────────
         self.generate_btn = tk.Button(
             self,
             text="Создать MD",
             command=self.on_generate_clicked,
         )
         self.generate_btn.grid(
-            row=4, column=0, columnspan=3, pady=(20, 10)
+            row=5, column=0, columnspan=3, pady=(20, 10)
         )
 
         # Статус и прогресс
         self.status = tk.Label(self, text="", fg="green")
-        self.status.grid(row=5, column=0, columnspan=3)
+        self.status.grid(row=6, column=0, columnspan=3)
 
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(
             self,
             variable=self.progress_var,
             maximum=100,  # будем использовать проценты
-            length=450,
+            length=650,
         )
-        self.progress_bar.grid(row=6, column=0, columnspan=3, pady=(10, 5))
+        self.progress_bar.grid(row=7, column=0, columnspan=3, pady=(10, 5))
 
         # Открытие папки
         self.open_folder_btn = tk.Button(
@@ -242,9 +275,9 @@ class App(tk.Tk):
             command=self._open_output_folder,
             state=tk.DISABLED,
         )
-        self.open_folder_btn.grid(row=7, column=0, columnspan=3, pady=(10, 5))
+        self.open_folder_btn.grid(row=8, column=0, columnspan=3, pady=(10, 5))
 
-        # Состояния
+        # ───── Состояния ────────────────────────────────
         self.settings = Settings.from_env()
         self.load_settings_to_ui()
         self.last_out_path: Optional[pathlib.Path] = None
@@ -257,6 +290,9 @@ class App(tk.Tk):
 
         # Переменная для прогресса (число файлов)
         self._progress_total: int = 0
+
+        # Список файлов, которые будут участвовать в генерации
+        self.available_files: List[pathlib.Path] = []
 
     def _run_loop(self) -> None:
         """Запускает event‑loop в отдельном потоке."""
@@ -299,6 +335,8 @@ class App(tk.Tk):
         if folder:
             self.src_entry.delete(0, tk.END)
             self.src_entry.insert(0, folder)
+            # После выбора папки сразу загружаем список файлов.
+            self.load_files_to_listbox()
 
     def browse_exclude(self) -> None:
         folder = filedialog.askdirectory()
@@ -313,6 +351,89 @@ class App(tk.Tk):
             new_text = ", ".join(parts)
             self.exclude_entry.delete(0, tk.END)
             self.exclude_entry.insert(0, new_text)
+
+    def load_files_to_listbox(self) -> None:
+        """
+        Считываем файлы из выбранной папки согласно расширениям и исключениям
+        и заполняем ListBox.
+        """
+        root_dir = pathlib.Path(self.src_entry.get().strip()).expanduser().resolve()
+        if not root_dir.is_dir():
+            return
+
+        exts = parse_extensions(self.ext_entry.get())
+        excludes = parse_exclusions(self.exclude_entry.get())
+
+        files = collect_source_files(root_dir, exts, excludes)
+
+        self.available_files = files
+        self.file_listbox.delete(0, tk.END)
+        for f in files:
+            try:
+                rel = f.relative_to(root_dir)
+                display = str(rel)
+            except ValueError:
+                display = f.name
+            self.file_listbox.insert(tk.END, display)
+
+    def add_file(self) -> None:
+        """
+        Открывает диалог выбора файлов и добавляет их в список,
+        если они удовлетворяют расширениям и не попадают под исключения.
+        """
+        root_dir = pathlib.Path(self.src_entry.get().strip()).expanduser().resolve()
+        if not root_dir.is_dir():
+            messagebox.showwarning("Предупреждение", "Сначала выберите папку с исходниками.")
+            return
+
+        selected_paths = filedialog.askopenfilenames(title="Выберите файлы для добавления")
+        if not selected_paths:
+            return
+
+        exts = parse_extensions(self.ext_entry.get())
+        excludes = parse_exclusions(self.exclude_entry.get())
+
+        added_any = False
+        for path_str in selected_paths:
+            p = pathlib.Path(path_str).resolve()
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in exts:
+                continue
+            # Проверяем, не попадает ли файл в исключённый каталог относительно root_dir.
+            try:
+                rel_parts = p.relative_to(root_dir).parts
+            except ValueError:
+                # Файл вне root_dir – игнорируем
+                continue
+            if any(part.lower() in excludes for part in rel_parts):
+                continue
+
+            if p in self.available_files:
+                continue  # уже есть
+
+            self.available_files.append(p)
+            try:
+                display = str(p.relative_to(root_dir))
+            except ValueError:
+                display = p.name
+            self.file_listbox.insert(tk.END, display)
+            added_any = True
+
+        if not added_any:
+            messagebox.showinfo("Информация", "Ни один файл не удовлетворил условиям.")
+
+    def remove_selected(self) -> None:
+        """
+        Удаляет выбранные элементы из списка и внутреннего массива.
+        """
+        indices = list(map(int, self.file_listbox.curselection()))
+        if not indices:
+            return
+        # удаляем с конца, чтобы индексы не смещались
+        for idx in reversed(indices):
+            del self.available_files[idx]
+            self.file_listbox.delete(idx)
 
     def on_generate_clicked(self) -> None:
         if self.is_generating:
@@ -347,6 +468,10 @@ class App(tk.Tk):
         self.open_folder_btn.config(state=tk.DISABLED)
         self.status.config(text="", fg="black")
 
+        # Если пользователь не изменил список вручную – обновляем его.
+        if not self.available_files:
+            self.load_files_to_listbox()
+
         asyncio.run_coroutine_threadsafe(
             self._run_generation(root_dir, extensions_set, exclude_set, out_name),
             self.loop,
@@ -361,8 +486,9 @@ class App(tk.Tk):
     ) -> None:
         """Обёртка над асинхронной генерацией с UI‑обновлениями."""
         try:
+            # Передаём список файлов, сформированный в UI
             out_path = await _generate_async(
-                self, root, exts, excludes, out_name
+                self, root, self.available_files, out_name
             )
         except Exception as exc:
             LOGGER.exception("Ошибка генерации Markdown")
