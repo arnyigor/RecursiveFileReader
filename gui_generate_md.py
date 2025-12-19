@@ -5,6 +5,8 @@
 Markdown‑генератор исходников с асинхронной генерацией,
 прогресс‑баром, сохранением конфигурации в .env (python-dotenv)
 и возможностью вручную управлять списком файлов для MD.
+Добавлена обратная функция – распаковка кода из Markdown
+в исходные файлы по путям, указанным в заголовках блоков.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import logging
 import mimetypes
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import threading
@@ -134,7 +137,8 @@ async def _generate_async(
     out_path = pathlib.Path(out_name).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    lang_map: dict[str, str] = {".kt": "kotlin", ".java": "java"}
+    # Маппинг расширения → «язык» (без точки)
+    lang_map: dict[str, str] = {ext.lstrip("."): ext[1:] for ext in app.settings.extensions}
 
     app.set_progress(len(files))
     try:
@@ -255,6 +259,14 @@ class App(tk.Tk):
             row=5, column=0, columnspan=3, pady=(20, 10)
         )
 
+        # ───── Распаковка ────────────────────────────────
+        self.extract_btn = tk.Button(
+            self,
+            text="Разпаковать MD",
+            command=self.on_extract_clicked,
+        )
+        self.extract_btn.grid(row=5, column=1, columnspan=2, pady=(20, 10))
+
         # Статус и прогресс
         self.status = tk.Label(self, text="", fg="green")
         self.status.grid(row=6, column=0, columnspan=3)
@@ -354,7 +366,7 @@ class App(tk.Tk):
 
     def load_files_to_listbox(self) -> None:
         """
-        Считываем файлы из выбранной папки согласно расширениям и исключениям
+        Считываем файлы из выбранной папки согласно расширениям и исключений
         и заполняем ListBox.
         """
         root_dir = pathlib.Path(self.src_entry.get().strip()).expanduser().resolve()
@@ -578,6 +590,94 @@ class App(tk.Tk):
             ",".join(sorted(self.settings.exclude)),
         )
         set_key(ENV_PATH, "OUTPUT", self.settings.output)
+
+    # ───── Распаковка MD ────────────────────────────────
+    def _select_md_file(self) -> Optional[pathlib.Path]:
+        md_path = filedialog.askopenfilename(
+            title="Выберите файл Markdown",
+            filetypes=[("Markdown", "*.md")],
+        )
+        return pathlib.Path(md_path).resolve() if md_path else None
+
+    async def _extract_async(self, root: pathlib.Path, md_file: pathlib.Path) -> List[pathlib.Path]:
+        """Распаковывает файлы из MD и возвращает список созданных путей."""
+        try:
+            md_text = md_file.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            raise RuntimeError(f"Не удалось прочитать MD: {exc}") from exc
+
+        # «lang» теперь опционален – может быть пустой строкой.
+        pattern = re.compile(
+            r"###\s+`([^`]+)`\s*\n\n```([^\s]*)\n(.*?)\n```",
+            re.DOTALL,
+        )
+        matches = list(pattern.finditer(md_text))
+        if not matches:
+            raise RuntimeError("В MD не найдено ни одного блока кода")
+
+        lang_to_ext = {"kotlin": ".kt", "java": ".java"}  # расширить при необходимости
+
+        created_paths: List[pathlib.Path] = []
+        for i, m in enumerate(matches, 1):
+            rel_path_raw, lang_tag, code = m.group(1), m.group(2), m.group(3)
+
+            rel_path = pathlib.Path(rel_path_raw)
+            if rel_path.is_absolute():
+                # Если в MD указали абсолютный путь – берём только имя файла
+                rel_path = rel_path.name
+
+            # Если язык не задан – берём расширение из пути,
+            # иначе используем маппинг.
+            ext = lang_to_ext.get(lang_tag.lower(), None) or (rel_path.suffix or ".txt")
+            final_path = root / rel_path.with_suffix(ext)
+
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                final_path.write_text(code.strip() + "\n", encoding="utf-8")
+            except Exception as exc:
+                raise RuntimeError(f"Не удалось записать {final_path}: {exc}") from exc
+
+            created_paths.append(final_path)
+            self.update_progress(i)
+        return created_paths
+
+    def on_extract_clicked(self) -> None:
+        if self.is_generating:   # блокируем, если уже генерируем
+            return
+        md_file = self._select_md_file()
+        if not md_file:
+            return
+
+        root_dir = pathlib.Path(self.src_entry.get().strip()).expanduser().resolve()
+        if not root_dir.is_dir():
+            messagebox.showerror("Ошибка", f"Папка {root_dir} не существует.")
+            return
+
+        self.is_generating = True
+        self.extract_btn.config(state=tk.DISABLED, text="Разпаковка…")
+        self.status.config(text="", fg="black")
+
+        asyncio.run_coroutine_threadsafe(
+            self._run_extraction(root_dir, md_file), self.loop
+        )
+
+    async def _run_extraction(self, root: pathlib.Path, md_file: pathlib.Path) -> None:
+        try:
+            created = await self._extract_async(root, md_file)
+        except Exception as exc:
+            LOGGER.exception("Ошибка при распаковке MD")
+            self.after(0, lambda: [
+                messagebox.showerror("Ошибка", f"Не удалось разпаковать:\n{exc}"),
+                self._reset_ui(),
+            ])
+            return
+
+        created_str = "\n".join(str(p.relative_to(root)) for p in created)
+        self.after(0, lambda: [
+            messagebox.showinfo("Готово", f"Создано файлов:\n{created_str}"),
+            self._reset_ui(),
+        ])
 
 
 # ───── Запуск ----------------------------------------------
