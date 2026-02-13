@@ -73,14 +73,39 @@ class Settings:
 
 
 # ───── Утилиты ────────────────────────────────────────────────
-def parse_extensions(raw: str) -> Set[str]:
+def _split_entries(raw: str) -> Set[str]:
+    """
+    Разбивает строку `raw` на элементы, разделённые запятой, пробелом
+    или их комбинацией. Возвращает *непустой* набор строк без
+    лишних пробелов.
+    """
     return {
-        f".{ext.lstrip('.').lower()}" for ext in raw.split(",") if ext.strip()
+        part.strip()
+        for part in re.split(r'[\s,]+', raw.strip())
+        if part.strip()
+    }
+
+
+def parse_extensions(raw: str) -> Set[str]:
+    """
+    Преобразует строку расширений в множество вида '.kt', '.java'.
+
+    Примеры входных данных:
+        - ".kt, .java"
+        - "kt java"
+        - ".kt,.java, kt , java"
+    """
+    return {
+        f".{ext.lstrip('.').lower()}"
+        for ext in _split_entries(raw)
     }
 
 
 def parse_exclusions(raw: str) -> Set[str]:
-    return {name.strip().lower() for name in raw.split(",") if name.strip()}
+    """
+    Аналогично `parse_extensions`, но без добавления точки.
+    """
+    return {name.strip().lower() for name in _split_entries(raw)}
 
 
 def _is_text_file(path: pathlib.Path) -> bool:

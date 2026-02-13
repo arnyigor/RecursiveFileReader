@@ -166,3 +166,4 @@ cython_debug/
 source_dump.md
 /settings.ini
 /output/
+/config.ini
