@@ -2,11 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Markdown‑генератор исходников с асинхронной генерацией,
-прогресс‑баром, сохранением конфигурации в .env (python-dotenv)
-и возможностью вручную управлять списком файлов для MD.
-Добавлена обратная функция – распаковка кода из Markdown
-в исходные файлы по путям, указанным в заголовках блоков.
+Улучшенный Markdown‑генератор с детальной статистикой файлов.
 """
 
 from __future__ import annotations
@@ -22,23 +18,19 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Iterable, List, Set, Optional
+from datetime import datetime
+from typing import Iterable, List, Set, Optional, Tuple, Dict
 
-# ───── Зависимости ────────────────────────────────────────────────
 try:
-    from dotenv import load_dotenv, set_key  # type: ignore
+    from dotenv import load_dotenv, set_key
 except ModuleNotFoundError as exc:
-    sys.stderr.write(
-        "Не найден пакет python‑dotenv. Установите его: pip install python-dotenv\n"
-    )
+    sys.stderr.write("pip install python-dotenv\n")
     raise exc
 
-# ───── GUI‑модули ────────────────────────────────────────────────
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from tkinter import ttk  # для прогресс‑бара
+from tkinter import ttk
 
-# ───── Настройки ────────────────────────────────────────────────
 ENV_PATH = pathlib.Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
@@ -50,35 +42,57 @@ logging.basicConfig(
 )
 
 
+def human_readable_size(size_bytes: int) -> str:
+    """Convert bytes to human readable format."""
+    if size_bytes == 0:
+        return "0 B"
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if abs(size_bytes) < 1024.0:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f} TB"
+
+
+def count_lines(content: str) -> int:
+    """Count non-empty lines."""
+    return len([line for line in content.splitlines() if line.strip()])
+
+
+def get_language_tag(extension: str) -> str:
+    """Map extension to markdown language."""
+    mapping = {
+        '.kt': 'kotlin', '.java': 'java', '.py': 'python',
+        '.js': 'javascript', '.ts': 'typescript', '.go': 'go',
+        '.rs': 'rust', '.cpp': 'cpp', '.c': 'c', '.cs': 'csharp',
+        '.rb': 'ruby', '.php': 'php', '.swift': 'swift',
+        '.json': 'json', '.xml': 'xml', '.yaml': 'yaml', '.yml': 'yaml',
+        '.sql': 'sql', '.sh': 'bash', '.html': 'html', '.css': 'css',
+    }
+    return mapping.get(extension.lower(), '')
+
+
 def _ensure_env_dir() -> None:
-    """Гарантирует существование каталога .env‑файла."""
     ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass(frozen=True)
 class Settings:
     source: pathlib.Path = field(default_factory=lambda: pathlib.Path.cwd())
-    extensions: Set[str] = field(default_factory=lambda: {".kt", ".java"})
-    exclude: Set[str] = field(default_factory=set)
+    extensions: Set[str] = field(default_factory=lambda: {".kt", ".java", ".py"})
+    exclude: Set[str] = field(default_factory=lambda: {"node_modules", "__pycache__", ".git"})
     output: str = "source_dump.md"
 
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
             source=pathlib.Path(os.getenv("SOURCE", "")).expanduser(),
-            extensions=parse_extensions(os.getenv("EXTENSIONS", "")),
+            extensions=parse_extensions(os.getenv("EXTENSIONS", ".kt,.java")),
             exclude=parse_exclusions(os.getenv("EXCLUDE", "")),
-            output=os.getenv("OUTPUT", ""),
+            output=os.getenv("OUTPUT", "source_dump.md"),
         )
 
 
-# ───── Утилиты ────────────────────────────────────────────────
 def _split_entries(raw: str) -> Set[str]:
-    """
-    Разбивает строку `raw` на элементы, разделённые запятой, пробелом
-    или их комбинацией. Возвращает *непустой* набор строк без
-    лишних пробелов.
-    """
     return {
         part.strip()
         for part in re.split(r'[\s,]+', raw.strip())
@@ -87,14 +101,6 @@ def _split_entries(raw: str) -> Set[str]:
 
 
 def parse_extensions(raw: str) -> Set[str]:
-    """
-    Преобразует строку расширений в множество вида '.kt', '.java'.
-
-    Примеры входных данных:
-        - ".kt, .java"
-        - "kt java"
-        - ".kt,.java, kt , java"
-    """
     return {
         f".{ext.lstrip('.').lower()}"
         for ext in _split_entries(raw)
@@ -102,9 +108,6 @@ def parse_extensions(raw: str) -> Set[str]:
 
 
 def parse_exclusions(raw: str) -> Set[str]:
-    """
-    Аналогично `parse_extensions`, но без добавления точки.
-    """
     return {name.strip().lower() for name in _split_entries(raw)}
 
 
@@ -122,11 +125,9 @@ def collect_source_files(
         return []
 
     files: List[pathlib.Path] = []
-
     for p in root.rglob("*"):
         if not p.is_file() or p.suffix.lower() not in extensions:
             continue
-        # Исключаем любые каталоги из списка exclude_dirs, даже если они находятся в пути.
         if any(part.lower() in exclude_dirs for part in p.parts):
             continue
         if not _is_text_file(p):
@@ -137,223 +138,212 @@ def collect_source_files(
     return sorted(files)
 
 
-def read_file_contents(file_path: pathlib.Path) -> str:
+def read_file_with_stats(file_path: pathlib.Path) -> Tuple[str, int, int]:
+    """Return content, size_bytes, line_count."""
     try:
-        return file_path.read_text(encoding="utf-8", errors="replace")
+        size = file_path.stat().st_size
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        lines = count_lines(content)
+        return content, size, lines
     except Exception as exc:
         LOGGER.warning("Не удалось прочитать %s: %s", file_path, exc)
-        return ""
+        return "", 0, 0
 
 
-# ───── Асинхронный слой генерации ─────────────────────────────────
 async def _generate_async(
         app: "App",
         root: pathlib.Path,
         files: List[pathlib.Path],
         out_name: str,
-) -> pathlib.Path:
-    """
-    Генерация MD‑файла из переданного списка файлов.
-    Прогресс обновляется через API App.
-    """
+) -> Tuple[pathlib.Path, Dict]:
+    """Generate MD with statistics."""
     if not files:
-        raise FileNotFoundError("Список исходных файлов пуст")
+        raise FileNotFoundError("Список файлов пуст")
 
     out_path = pathlib.Path(out_name).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Маппинг расширения → «язык» (без точки)
-    lang_map: dict[str, str] = {ext.lstrip("."): ext[1:] for ext in app.settings.extensions}
+    stats = {
+        'total_files': 0,
+        'total_lines': 0,
+        'total_size': 0,
+        'languages': set()
+    }
 
     app.set_progress(len(files))
+
     try:
         with out_path.open("w", encoding="utf-8") as f:
+            # Header
+            f.write(f"# Source Code Documentation\n\n")
+            f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n")
+            f.write(f"**Root:** `{root}`\n\n")
+
+            # Process files first to collect stats
+            file_data = []
             for idx, path in enumerate(files, 1):
-                if not app.is_generating:   # пользователь нажал «Отмена» (не реализовано)
+                if not app.is_generating:
                     break
-                content = await asyncio.to_thread(read_file_contents, path)
-                lang_tag = lang_map.get(path.suffix.lower(), "")
+
+                content, size, lines = await asyncio.to_thread(read_file_with_stats, path)
+                if size > 0 or content:
+                    file_data.append((path, content, size, lines))
+                    stats['total_files'] += 1
+                    stats['total_lines'] += lines
+                    stats['total_size'] += size
+                    stats['languages'].add(path.suffix.lower())
+
+                if idx % max(1, len(files) // 20) == 0:
+                    app.update_progress(idx)
+
+            # Write summary
+            f.write("## Summary Statistics\n\n")
+            f.write(f"- **Total Files:** {stats['total_files']}\n")
+            f.write(f"- **Total Lines:** {stats['total_lines']:,}\n")
+            f.write(f"- **Total Size:** {human_readable_size(stats['total_size'])}\n")
+            f.write(f"- **Languages:** {', '.join(sorted(stats['languages']))}\n")
+            f.write(f"- **Avg Size:** {human_readable_size(stats['total_size'] // max(stats['total_files'], 1))}\n\n")
+            f.write("---\n\n")
+
+            # Write files with metadata
+            for path, content, size, lines in file_data:
                 try:
                     rel_path = path.relative_to(root)
                 except ValueError:
                     rel_path = path.name
+
+                lang_tag = get_language_tag(path.suffix)
+                size_str = human_readable_size(size)
+
                 f.write(f"### `{rel_path}`\n\n")
+                f.write(f"**Size:** {size_str} | **Lines:** {lines} | **Type:** {path.suffix[1:].upper()}\n\n")
                 f.write(f"```{lang_tag}\n{content.rstrip()}\n```\n\n")
 
-                if idx % max(1, len(files) // 20) == 0:   # каждые 5%
-                    app.update_progress(idx)
     finally:
         app.set_progress(0)
 
-    return out_path
+    return out_path, stats
 
 
-# ───── GUI ──────────────────────
 class App(tk.Tk):
-    """Основное окно приложения."""
-
     def __init__(self) -> None:
         super().__init__()
-        self.title("Markdown‑генератор исходников")
-        # Увеличиваем геометрию окна для удобства работы со списком файлов.
-        self.geometry("800x700")
-        self.resizable(False, False)
+        self.title("Markdown Generator with Statistics")
+        self.geometry("900x800")
+        self.resizable(True, True)
 
-        # ───── Виджеты ────────────────────────────────
-        tk.Label(self, text="Папка с исходниками:").grid(
-            row=0,
-            column=0,
-            padx=10,
-            pady=(15, 5),
-            sticky=tk.W,
+        # Configure grid weights
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(4, weight=1)
+
+        # Labels and Entries
+        tk.Label(self, text="Source folder:", anchor="w").grid(
+            row=0, column=0, padx=10, pady=(15, 5), sticky="ew"
         )
-        self.src_entry = tk.Entry(self, width=60)
-        self.src_entry.grid(row=0, column=1, padx=5, pady=(15, 5))
-        tk.Button(
-            self, text="Обзор…", command=self.browse_src
-        ).grid(row=0, column=2, padx=5)
+        self.src_entry = tk.Entry(self)
+        self.src_entry.grid(row=0, column=1, padx=5, pady=(15, 5), sticky="ew")
+        tk.Button(self, text="Browse…", command=self.browse_src).grid(row=0, column=2, padx=5)
 
-        tk.Label(self, text="Расширения (запятая):").grid(
-            row=1,
-            column=0,
-            sticky=tk.W,
-            padx=10,
-        )
-        self.ext_entry = tk.Entry(self, width=60)
-        self.ext_entry.grid(row=1, column=1, padx=5)
+        tk.Label(self, text="Extensions (comma):", anchor="w").grid(row=1, column=0, sticky="w", padx=10)
+        self.ext_entry = tk.Entry(self)
+        self.ext_entry.grid(row=1, column=1, padx=5, sticky="ew")
 
-        tk.Label(self, text="Исключать папки (через запятую):").grid(
-            row=2,
-            column=0,
-            sticky=tk.W,
-            padx=10,
-        )
-        self.exclude_entry = tk.Entry(self, width=60)
-        self.exclude_entry.grid(row=2, column=1, padx=5)
+        tk.Label(self, text="Exclude folders:", anchor="w").grid(row=2, column=0, sticky="w", padx=10)
+        self.exclude_entry = tk.Entry(self)
+        self.exclude_entry.grid(row=2, column=1, padx=5, sticky="ew")
+        tk.Button(self, text="Browse…", command=self.browse_exclude).grid(row=2, column=2, padx=5)
 
-        tk.Button(
-            self, text="Обзор…", command=self.browse_exclude
-        ).grid(row=2, column=2, padx=5)
+        tk.Label(self, text="Output filename:", anchor="w").grid(row=3, column=0, sticky="w", padx=10)
+        self.out_entry = tk.Entry(self)
+        self.out_entry.grid(row=3, column=1, padx=5, sticky="ew")
 
-        tk.Label(self, text="Имя md‑файла:").grid(
-            row=3,
-            column=0,
-            sticky=tk.W,
-            padx=10,
-        )
-        self.out_entry = tk.Entry(self, width=60)
-        self.out_entry.grid(row=3, column=1, padx=5)
+        # File list with scrollbar
+        list_frame = ttk.LabelFrame(self, text="Files to Process")
+        list_frame.grid(row=4, column=0, columnspan=3, padx=10, pady=10, sticky="nsew")
+        list_frame.grid_columnconfigure(0, weight=1)
+        list_frame.grid_rowconfigure(0, weight=1)
 
-        # ───── Список файлов ────────────────────────────────
-        list_frame = ttk.LabelFrame(self, text="Список файлов для MD")
-        list_frame.grid(row=4, column=0, columnspan=3, padx=10, pady=(15, 5), sticky="nsew")
-
-        self.file_listbox = tk.Listbox(
-            list_frame,
-            width=80,
-            height=12,
-            selectmode=tk.MULTIPLE,
-        )
+        self.file_listbox = tk.Listbox(list_frame, selectmode=tk.MULTIPLE, font=("Consolas", 9))
         self.file_listbox.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=5)
 
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.file_listbox.yview)
         scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 10), pady=5)
         self.file_listbox.configure(yscrollcommand=scrollbar.set)
 
-        btn_add_file = tk.Button(
-            list_frame,
-            text="Добавить файл…",
-            command=self.add_file,
-        )
-        btn_add_file.grid(row=1, column=0, sticky="w", padx=(10, 5), pady=2)
+        # Buttons frame
+        btn_frame = tk.Frame(list_frame)
+        btn_frame.grid(row=1, column=0, columnspan=2, pady=5)
 
-        btn_remove_sel = tk.Button(
-            list_frame,
-            text="Удалить выбранные",
-            command=self.remove_selected,
-        )
-        btn_remove_sel.grid(row=1, column=0, sticky="e", padx=(5, 10), pady=2)
+        tk.Button(btn_frame, text="➕ Add Files", command=self.add_file).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="🗑️ Remove Selected", command=self.remove_selected).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="🔄 Refresh List", command=self.load_files_to_listbox).pack(side=tk.LEFT, padx=5)
 
-        # ───── Генерация ────────────────────────────────
+        # Action buttons
+        action_frame = tk.Frame(self)
+        action_frame.grid(row=5, column=0, columnspan=3, pady=10)
+
         self.generate_btn = tk.Button(
-            self,
-            text="Создать MD",
-            command=self.on_generate_clicked,
+            action_frame, text="📄 Generate MD", command=self.on_generate_clicked,
+            bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), padx=20
         )
-        self.generate_btn.grid(
-            row=5, column=0, columnspan=3, pady=(20, 10)
-        )
+        self.generate_btn.pack(side=tk.LEFT, padx=5)
 
-        # ───── Распаковка ────────────────────────────────
         self.extract_btn = tk.Button(
-            self,
-            text="Разпаковать MD",
-            command=self.on_extract_clicked,
+            action_frame, text="📂 Extract MD", command=self.on_extract_clicked,
+            bg="#2196F3", fg="white", font=("Arial", 10, "bold"), padx=20
         )
-        self.extract_btn.grid(row=5, column=1, columnspan=2, pady=(20, 10))
+        self.extract_btn.pack(side=tk.LEFT, padx=5)
 
-        # Статус и прогресс
+        # Statistics label
+        self.stats_label = tk.Label(self, text="", fg="blue", font=("Arial", 9, "italic"))
+        self.stats_label.grid(row=6, column=0, columnspan=3)
+
+        # Status and Progress
         self.status = tk.Label(self, text="", fg="green")
-        self.status.grid(row=6, column=0, columnspan=3)
+        self.status.grid(row=7, column=0, columnspan=3)
 
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(
-            self,
-            variable=self.progress_var,
-            maximum=100,  # будем использовать проценты
-            length=650,
+            self, variable=self.progress_var, maximum=100, length=750
         )
-        self.progress_bar.grid(row=7, column=0, columnspan=3, pady=(10, 5))
+        self.progress_bar.grid(row=8, column=0, columnspan=3, pady=(10, 5), padx=10)
 
-        # Открытие папки
+        # Open folder button
         self.open_folder_btn = tk.Button(
-            self,
-            text="Открыть папку",
-            command=self._open_output_folder,
-            state=tk.DISABLED,
+            self, text="📁 Open Output Folder", command=self._open_output_folder,
+            state=tk.DISABLED
         )
-        self.open_folder_btn.grid(row=8, column=0, columnspan=3, pady=(10, 5))
+        self.open_folder_btn.grid(row=9, column=0, columnspan=3, pady=(5, 15))
 
-        # ───── Состояния ────────────────────────────────
+        # State
         self.settings = Settings.from_env()
         self.load_settings_to_ui()
         self.last_out_path: Optional[pathlib.Path] = None
+        self.last_stats: Optional[Dict] = None
         self.is_generating: bool = False
 
-        # Асинхронный цикл + executor
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self._run_loop, daemon=True).start()
         self.executor = ThreadPoolExecutor(max_workers=4)
-
-        # Переменная для прогресса (число файлов)
         self._progress_total: int = 0
-
-        # Список файлов, которые будут участвовать в генерации
         self.available_files: List[pathlib.Path] = []
 
     def _run_loop(self) -> None:
-        """Запускает event‑loop в отдельном потоке."""
         asyncio.set_event_loop(self.loop)
         try:
             self.loop.run_forever()
         except Exception as exc:
-            LOGGER.exception("Ошибка в цикле событий: %s", exc)
+            LOGGER.exception("Event loop error: %s", exc)
 
-    # ───── Конфигурация UI ────────────────────────
     def load_settings_to_ui(self) -> None:
         self.src_entry.delete(0, tk.END)
         self.src_entry.insert(0, str(self.settings.source))
 
         self.ext_entry.delete(0, tk.END)
-        self.ext_entry.insert(
-            0,
-            ",".join(ext.lstrip(".") for ext in sorted(self.settings.extensions)),
-        )
+        self.ext_entry.insert(0, ",".join(ext.lstrip(".") for ext in sorted(self.settings.extensions)))
 
         self.exclude_entry.delete(0, tk.END)
-        self.exclude_entry.insert(
-            0, ", ".join(sorted(self.settings.exclude))
-        )
+        self.exclude_entry.insert(0, ", ".join(sorted(self.settings.exclude)))
 
         self.out_entry.delete(0, tk.END)
         self.out_entry.insert(0, self.settings.output)
@@ -366,108 +356,83 @@ class App(tk.Tk):
             output=self.out_entry.get().strip() or "source_dump.md",
         )
 
-    # ───── Обработчики UI ────────────────────────
     def browse_src(self) -> None:
         folder = filedialog.askdirectory()
         if folder:
             self.src_entry.delete(0, tk.END)
             self.src_entry.insert(0, folder)
-            # После выбора папки сразу загружаем список файлов.
             self.load_files_to_listbox()
 
     def browse_exclude(self) -> None:
         folder = filedialog.askdirectory()
-        if not folder:
-            return
-        folder_name = pathlib.Path(folder).name.lower()
-        parts = [
-            p.strip() for p in self.exclude_entry.get().split(",") if p.strip()
-        ]
-        if folder_name not in (p.lower() for p in parts):
-            parts.append(folder_name)
-            new_text = ", ".join(parts)
-            self.exclude_entry.delete(0, tk.END)
-            self.exclude_entry.insert(0, new_text)
+        if folder:
+            folder_name = pathlib.Path(folder).name.lower()
+            parts = [p.strip() for p in self.exclude_entry.get().split(",") if p.strip()]
+            if folder_name not in (p.lower() for p in parts):
+                parts.append(folder_name)
+                self.exclude_entry.delete(0, tk.END)
+                self.exclude_entry.insert(0, ", ".join(parts))
 
     def load_files_to_listbox(self) -> None:
-        """
-        Считываем файлы из выбранной папки согласно расширениям и исключений
-        и заполняем ListBox.
-        """
         root_dir = pathlib.Path(self.src_entry.get().strip()).expanduser().resolve()
         if not root_dir.is_dir():
             return
 
         exts = parse_extensions(self.ext_entry.get())
         excludes = parse_exclusions(self.exclude_entry.get())
-
         files = collect_source_files(root_dir, exts, excludes)
 
         self.available_files = files
         self.file_listbox.delete(0, tk.END)
+
+        total_size = 0
         for f in files:
             try:
+                size = f.stat().st_size
+                total_size += size
                 rel = f.relative_to(root_dir)
-                display = str(rel)
+                display = f"{rel} ({human_readable_size(size)})"
             except ValueError:
-                display = f.name
+                display = f"{f.name} ({human_readable_size(f.stat().st_size)})"
             self.file_listbox.insert(tk.END, display)
 
+        self.stats_label.config(text=f"Files: {len(files)} | Total size: {human_readable_size(total_size)}")
+
     def add_file(self) -> None:
-        """
-        Открывает диалог выбора файлов и добавляет их в список,
-        если они удовлетворяют расширениям и не попадают под исключения.
-        """
         root_dir = pathlib.Path(self.src_entry.get().strip()).expanduser().resolve()
         if not root_dir.is_dir():
-            messagebox.showwarning("Предупреждение", "Сначала выберите папку с исходниками.")
+            messagebox.showwarning("Warning", "Select source folder first.")
             return
 
-        selected_paths = filedialog.askopenfilenames(title="Выберите файлы для добавления")
-        if not selected_paths:
+        selected = filedialog.askopenfilenames(title="Select files")
+        if not selected:
             return
 
         exts = parse_extensions(self.ext_entry.get())
         excludes = parse_exclusions(self.exclude_entry.get())
 
-        added_any = False
-        for path_str in selected_paths:
+        for path_str in selected:
             p = pathlib.Path(path_str).resolve()
-            if not p.is_file():
+            if not p.is_file() or p.suffix.lower() not in exts:
                 continue
-            if p.suffix.lower() not in exts:
-                continue
-            # Проверяем, не попадает ли файл в исключённый каталог относительно root_dir.
             try:
                 rel_parts = p.relative_to(root_dir).parts
             except ValueError:
-                # Файл вне root_dir – игнорируем
                 continue
             if any(part.lower() in excludes for part in rel_parts):
                 continue
-
-            if p in self.available_files:
-                continue  # уже есть
-
-            self.available_files.append(p)
-            try:
-                display = str(p.relative_to(root_dir))
-            except ValueError:
-                display = p.name
-            self.file_listbox.insert(tk.END, display)
-            added_any = True
-
-        if not added_any:
-            messagebox.showinfo("Информация", "Ни один файл не удовлетворил условиям.")
+            if p not in self.available_files:
+                self.available_files.append(p)
+                try:
+                    display = f"{p.relative_to(root_dir)} ({human_readable_size(p.stat().st_size)})"
+                except ValueError:
+                    display = f"{p.name} ({human_readable_size(p.stat().st_size)})"
+                self.file_listbox.insert(tk.END, display)
 
     def remove_selected(self) -> None:
-        """
-        Удаляет выбранные элементы из списка и внутреннего массива.
-        """
         indices = list(map(int, self.file_listbox.curselection()))
         if not indices:
             return
-        # удаляем с конца, чтобы индексы не смещались
         for idx in reversed(indices):
             del self.available_files[idx]
             self.file_listbox.delete(idx)
@@ -476,117 +441,76 @@ class App(tk.Tk):
         if self.is_generating:
             return
 
-        src_path_str = self.src_entry.get().strip()
-        extensions_raw = self.ext_entry.get().strip()
-        exclude_raw = self.exclude_entry.get().strip()
-        out_name = self.out_entry.get().strip()
-
-        if not src_path_str:
-            messagebox.showerror("Ошибка", "Путь к папке не указан.")
-            return
-        if not extensions_raw:
-            messagebox.showerror("Ошибка", "Расширения файлов не заданы.")
+        settings = self.get_current_settings()
+        if not settings.source.is_dir():
+            messagebox.showerror("Error", f"Folder not found: {settings.source}")
             return
 
-        root_dir = pathlib.Path(src_path_str).expanduser().resolve()
-        if not root_dir.is_dir():
-            messagebox.showerror(
-                "Ошибка",
-                f"Папка {root_dir} не существует.",
-            )
-            return
-
-        extensions_set = parse_extensions(extensions_raw)
-        exclude_set = parse_exclusions(exclude_raw)
-
-        # UI‑блокировка
         self.is_generating = True
-        self.generate_btn.config(state=tk.DISABLED, text="Генерация…")
+        self.generate_btn.config(state=tk.DISABLED, text="Generating…")
         self.open_folder_btn.config(state=tk.DISABLED)
         self.status.config(text="", fg="black")
 
-        # Если пользователь не изменил список вручную – обновляем его.
         if not self.available_files:
             self.load_files_to_listbox()
 
         asyncio.run_coroutine_threadsafe(
-            self._run_generation(root_dir, extensions_set, exclude_set, out_name),
+            self._run_generation(settings.source, settings.extensions, settings.exclude, settings.output),
             self.loop,
         )
 
-    async def _run_generation(
-            self,
-            root: pathlib.Path,
-            exts: Set[str],
-            excludes: Set[str],
-            out_name: str,
-    ) -> None:
-        """Обёртка над асинхронной генерацией с UI‑обновлениями."""
+    async def _run_generation(self, root: pathlib.Path, exts: Set[str], excludes: Set[str], out_name: str) -> None:
         try:
-            # Передаём список файлов, сформированный в UI
-            out_path = await _generate_async(
-                self, root, self.available_files, out_name
-            )
+            out_path, stats = await _generate_async(self, root, self.available_files, out_name)
         except Exception as exc:
-            LOGGER.exception("Ошибка генерации Markdown")
+            LOGGER.exception("Generation error")
             self.after(0, lambda: [
-                messagebox.showerror("Ошибка", f"Не удалось создать MD:\n{exc}"),
+                messagebox.showerror("Error", f"Failed to generate:\n{exc}"),
                 self._reset_ui(),
             ])
             return
 
-        # Успешно – сохраняем настройки
         self.settings = self.get_current_settings()
         self._save_env()
-
         self.last_out_path = out_path
+        self.last_stats = stats
+
+        stats_text = f"Files: {stats['total_files']} | Lines: {stats['total_lines']:,} | Size: {human_readable_size(stats['total_size'])}"
+
         self.after(0, lambda: [
             self.open_folder_btn.config(state=tk.NORMAL),
-            self.status.config(
-                text=f"✅ {out_path.name} создан в {out_path.parent}",
-                fg="green",
-            ),
-            self.generate_btn.config(state=tk.NORMAL, text="Создать MD"),
+            self.status.config(text=f"✅ {out_path.name} | {stats_text}", fg="green"),
+            self.generate_btn.config(state=tk.NORMAL, text="📄 Generate MD"),
+            self.stats_label.config(text=stats_text)
         ])
         self.is_generating = False
 
     def _reset_ui(self) -> None:
-        self.generate_btn.config(state=tk.NORMAL, text="Создать MD")
+        self.generate_btn.config(state=tk.NORMAL, text="📄 Generate MD")
+        self.extract_btn.config(state=tk.NORMAL, text="📂 Extract MD")
         self.open_folder_btn.config(state=tk.DISABLED)
         self.status.config(text="", fg="black")
         self.is_generating = False
 
-    # ───── Прогресс‑бар ─────────────────────────
     def set_progress(self, total: int) -> None:
-        """Инициирует прогресс‑бар для указанного количества файлов."""
-        if total <= 0:
-            self.progress_var.set(0)
-            return
         self._progress_total = total
-        # прогресс от 0 до 100 %
         self.after(0, lambda: [
             self.progress_bar.config(maximum=100),
             self.progress_var.set(0),
-            self.status.config(text="Начинаем сбор…"),
+            self.status.config(text=f"Processing {total} files…"),
         ])
 
     def update_progress(self, current: int) -> None:
-        """Обновление прогресса (вызывается из async‑задания)."""
         if not self._progress_total:
             return
         percent = (current / self._progress_total) * 100
-        # UI‑обновления в главном потоке
         self.after(0, lambda: [
             self.progress_var.set(percent),
-            self.status.config(
-                text=f"Обработано {current} из {self._progress_total}"
-            ),
+            self.status.config(text=f"Processed {current}/{self._progress_total}")
         ])
 
-    # ───── Открытие папки ─────────────────────────
     def _open_output_folder(self) -> None:
         if not self.last_out_path:
-            messagebox.showinfo("Информация", "Файл ещё не создан.")
             return
         path_str = str(self.last_out_path.parent)
         try:
@@ -597,78 +521,63 @@ class App(tk.Tk):
             else:
                 subprocess.run(["xdg-open", path_str], check=True)
         except Exception as exc:
-            messagebox.showerror("Ошибка", f"Не удалось открыть папку:\n{exc}")
+            messagebox.showerror("Error", f"Cannot open folder:\n{exc}")
 
-    # ───── Сохранение в .env ------------------------------
     def _save_env(self) -> None:
-        """Записывает актуальные настройки в файл <script>.env."""
         _ensure_env_dir()
         set_key(ENV_PATH, "SOURCE", str(self.settings.source))
-        set_key(
-            ENV_PATH,
-            "EXTENSIONS",
-            ",".join(sorted(ext.lstrip(".") for ext in self.settings.extensions)),
-        )
-        set_key(
-            ENV_PATH,
-            "EXCLUDE",
-            ",".join(sorted(self.settings.exclude)),
-        )
+        set_key(ENV_PATH, "EXTENSIONS", ",".join(sorted(ext.lstrip(".") for ext in self.settings.extensions)))
+        set_key(ENV_PATH, "EXCLUDE", ",".join(sorted(self.settings.exclude)))
         set_key(ENV_PATH, "OUTPUT", self.settings.output)
 
-    # ───── Распаковка MD ────────────────────────────────
     def _select_md_file(self) -> Optional[pathlib.Path]:
         md_path = filedialog.askopenfilename(
-            title="Выберите файл Markdown",
+            title="Select Markdown file",
             filetypes=[("Markdown", "*.md")],
         )
         return pathlib.Path(md_path).resolve() if md_path else None
 
     async def _extract_async(self, root: pathlib.Path, md_file: pathlib.Path) -> List[pathlib.Path]:
-        """Распаковывает файлы из MD и возвращает список созданных путей."""
-        try:
-            md_text = md_file.read_text(encoding="utf-8", errors="replace")
-        except Exception as exc:
-            raise RuntimeError(f"Не удалось прочитать MD: {exc}") from exc
+        md_text = md_file.read_text(encoding="utf-8", errors="replace")
 
-        # «lang» теперь опционален – может быть пустой строкой.
+        # Improved pattern to handle optional metadata line
         pattern = re.compile(
-            r"###\s+`([^`]+)`\s*\n\n```([^\s]*)\n(.*?)\n```",
+            r"###\s+`([^`]+)`\s*\n"
+            r"(?:\*\*Size:\*\*[^|]+\|\s*\*\*Lines:\*\*[^|]+\|\s*\*\*Type:\*\*[^\n]*\n\n)?"
+            r"```([^\s]*)\n(.*?)\n```",
             re.DOTALL,
         )
         matches = list(pattern.finditer(md_text))
         if not matches:
-            raise RuntimeError("В MD не найдено ни одного блока кода")
+            raise RuntimeError("No code blocks found in Markdown")
 
-        lang_to_ext = {"kotlin": ".kt", "java": ".java"}  # расширить при необходимости
+        lang_to_ext = {v: k for k, v in {
+            '.kt': 'kotlin', '.java': 'java', '.py': 'python',
+            '.js': 'javascript', '.ts': 'typescript'
+        }.items()}
 
         created_paths: List[pathlib.Path] = []
         for i, m in enumerate(matches, 1):
             rel_path_raw, lang_tag, code = m.group(1), m.group(2), m.group(3)
-
             rel_path = pathlib.Path(rel_path_raw)
             if rel_path.is_absolute():
-                # Если в MD указали абсолютный путь – берём только имя файла
-                rel_path = rel_path.name
+                rel_path = pathlib.Path(rel_path.name)
 
-            # Если язык не задан – берём расширение из пути,
-            # иначе используем маппинг.
-            ext = lang_to_ext.get(lang_tag.lower(), None) or (rel_path.suffix or ".txt")
-            final_path = root / rel_path.with_suffix(ext)
-
+            ext = lang_to_ext.get(lang_tag.lower()) or rel_path.suffix or ".txt"
+            final_path = (root / rel_path).with_suffix(ext)
             final_path.parent.mkdir(parents=True, exist_ok=True)
 
             try:
                 final_path.write_text(code.strip() + "\n", encoding="utf-8")
+                created_paths.append(final_path)
             except Exception as exc:
-                raise RuntimeError(f"Не удалось записать {final_path}: {exc}") from exc
+                raise RuntimeError(f"Cannot write {final_path}: {exc}")
 
-            created_paths.append(final_path)
             self.update_progress(i)
         return created_paths
 
     def on_extract_clicked(self) -> None:
-        if self.is_generating:   # блокируем, если уже генерируем
+        if self.is_generating:
             return
         md_file = self._select_md_file()
         if not md_file:
@@ -676,41 +585,36 @@ class App(tk.Tk):
 
         root_dir = pathlib.Path(self.src_entry.get().strip()).expanduser().resolve()
         if not root_dir.is_dir():
-            messagebox.showerror("Ошибка", f"Папка {root_dir} не существует.")
+            messagebox.showerror("Error", f"Folder not found: {root_dir}")
             return
 
         self.is_generating = True
-        self.extract_btn.config(state=tk.DISABLED, text="Разпаковка…")
-        self.status.config(text="", fg="black")
+        self.extract_btn.config(state=tk.DISABLED, text="Extracting…")
 
-        asyncio.run_coroutine_threadsafe(
-            self._run_extraction(root_dir, md_file), self.loop
-        )
+        asyncio.run_coroutine_threadsafe(self._run_extraction(root_dir, md_file), self.loop)
 
     async def _run_extraction(self, root: pathlib.Path, md_file: pathlib.Path) -> None:
         try:
             created = await self._extract_async(root, md_file)
         except Exception as exc:
-            LOGGER.exception("Ошибка при распаковке MD")
+            LOGGER.exception("Extraction error")
             self.after(0, lambda: [
-                messagebox.showerror("Ошибка", f"Не удалось разпаковать:\n{exc}"),
+                messagebox.showerror("Error", f"Extraction failed:\n{exc}"),
                 self._reset_ui(),
             ])
             return
 
         created_str = "\n".join(str(p.relative_to(root)) for p in created)
         self.after(0, lambda: [
-            messagebox.showinfo("Готово", f"Создано файлов:\n{created_str}"),
+            messagebox.showinfo("Done", f"Created {len(created)} files:\n{created_str}"),
             self._reset_ui(),
         ])
 
 
-# ───── Запуск ----------------------------------------------
 def main() -> None:
     app = App()
     app.mainloop()
 
 
 if __name__ == "__main__":
-    sys.argv[:] = [sys.argv[0]]
     main()
