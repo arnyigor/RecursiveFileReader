@@ -275,7 +275,13 @@ def unpack_command(input_path=None, out_dir=None):
         print("Ошибка извлечения архива: {}".format(exc), file=sys.stderr)
         return 1
 
-    restored_path = target_dir / meta["name"]
+    restore_root = meta.get("root")
+    if restore_root:
+        restored_path = target_dir / restore_root
+    elif "name" in meta:
+        restored_path = target_dir / meta["name"]
+    else:
+        restored_path = target_dir
 
     print("[+] Готово")
     print("    Источник: {}".format(source_desc))
