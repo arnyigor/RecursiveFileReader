@@ -167,3 +167,10 @@ source_dump.md
 /settings.ini
 /output/
 /config.ini
+/Figma.txt
+/Data.md
+/FigmaInput.txt
+/FigmaOutput.md
+*.ft.txt
+/restored/
+
