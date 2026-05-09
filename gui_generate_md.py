@@ -4,6 +4,7 @@
 """
 Markdown-генератор с поддержкой ограничений ввода.
 Фикс: нижние кнопки всегда видны независимо от размера списка.
+Исправлена логика синхронизации состояний выделения файлов.
 """
 
 from __future__ import annotations
@@ -79,7 +80,7 @@ class CheckboxTreeview(ttk.Treeview):
         self._base_texts: Dict[str, str] = {}
 
     def insert_node(
-        self, parent, text, node_type="file", path=None, checked=True, **kw
+            self, parent, text, node_type="file", path=None, checked=True, **kw
     ):
         state = self.TAG_CHECKED if checked else self.TAG_UNCHECKED
         prefix = self._check_chars[state]
@@ -221,11 +222,6 @@ def human_readable_size(size_bytes: int) -> str:
 
 
 def _substring_match(text: str, query: str) -> bool:
-    """Check if query appears as a contiguous substring in text (case-insensitive).
-
-    Example: 'gui' matches 'gui_main.py' and 'config_gui.py'
-             but NOT 'generate_utils.py' (no contiguous 'gui').
-    """
     if not query:
         return True
     return query.lower() in text.lower()
@@ -284,9 +280,9 @@ def _is_text_file(path: pathlib.Path) -> bool:
 
 
 def collect_source_files(
-    root: pathlib.Path,
-    extensions: Set[str],
-    exclude_dirs: Set[str],
+        root: pathlib.Path,
+        extensions: Set[str],
+        exclude_dirs: Set[str],
 ) -> List[pathlib.Path]:
     if not root.is_dir():
         return []
@@ -438,7 +434,7 @@ def split_into_chunks(root, file_data, limits, stats):
                     current_lines,
                     limits.estimate_tokens(current_text),
                     list(current_files),
-                )
+                    )
             )
         current_text, current_files, current_lines = "", [], 0
 
@@ -457,7 +453,7 @@ def split_into_chunks(root, file_data, limits, stats):
         if effective_limit > 0 and bc > effective_limit - header_len:
             avail = effective_limit - len(current_text) - 100
             if avail > 200:
-                t = block[:avail] + f"\n\n<!-- TRUNCATED: {bc} chars -->\n\n"
+                t = block[:avail] + f"\n\n\n\n"
                 current_text += t
                 current_lines += t.count("\n")
                 current_files.append(f"{rel_path} [TRUNCATED]")
@@ -465,7 +461,7 @@ def split_into_chunks(root, file_data, limits, stats):
                 _flush()
                 current_text = _build_header(root, len(chunks) + 1, 0)
                 t = block[: max(effective_limit - header_len - 100, 200)]
-                t += "\n\n<!-- TRUNCATED -->\n\n"
+                t += "\n\n\n\n"
                 current_text += t
                 current_lines = current_text.count("\n")
                 current_files.append(f"{rel_path} [TRUNCATED]")
@@ -529,8 +525,8 @@ async def _generate_async(app, root, files, out_name, limits):
     else:
         for c in chunks:
             p = (
-                out_base.parent
-                / f"{out_base.stem}_part{c.part_number}{out_base.suffix or '.md'}"
+                    out_base.parent
+                    / f"{out_base.stem}_part{c.part_number}{out_base.suffix or '.md'}"
             )
             p.write_text(c.content, encoding="utf-8")
             created.append(p)
@@ -552,18 +548,6 @@ async def _generate_async(app, root, files, out_name, limits):
 # ═══════════════════════════════════════════════════════════
 #  GUI — трёхзонная компоновка
 # ═══════════════════════════════════════════════════════════
-#
-#  ┌─────────────────────────────────────┐
-#  │  TOP_FRAME (фиксированная высота)  │  ← настройки, лимиты
-#  ├─────────────────────────────────────┤
-#  │                                     │
-#  │  MID_FRAME (растягивается)         │  ← список файлов
-#  │                                     │
-#  ├─────────────────────────────────────┤
-#  │  BOT_FRAME (фиксированная высота)  │  ← кнопки, прогресс
-#  └─────────────────────────────────────┘
-#
-#  BOT_FRAME всегда виден, даже если файлов 10 000.
 
 
 class App(tk.Tk):
@@ -575,15 +559,12 @@ class App(tk.Tk):
         self.resizable(True, True)
 
         # ═══ Три зоны ═══
-        # TOP — не растягивается
         top_frame = tk.Frame(self)
         top_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 0))
 
-        # MID — растягивается (список файлов)
         mid_frame = tk.Frame(self)
         mid_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # BOT — не растягивается, ВСЕГДА ВИДНА
         bot_frame = tk.Frame(self)
         bot_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
 
@@ -743,7 +724,7 @@ class App(tk.Tk):
         list_inner.pack(fill=tk.BOTH, expand=True)
 
         self.file_listbox = tk.Listbox(
-            list_inner, selectmode=tk.MULTIPLE, font=("Consolas", 9)
+            list_inner, selectmode=tk.MULTIPLE, font=("Consolas", 9), exportselection=False
         )
         self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -797,10 +778,8 @@ class App(tk.Tk):
 
         # ═══════════════════════════════════════
         #  BOT: Кнопки, статус, прогресс
-        #  ВСЕГДА ВИДНА — pack(side=BOTTOM)
         # ═══════════════════════════════════════
 
-        # Разделитель
         ttk.Separator(bot_frame, orient="horizontal").pack(fill=tk.X, pady=(0, 8))
 
         # Action buttons
@@ -884,8 +863,6 @@ class App(tk.Tk):
             self._search_entry.config(fg="gray")
 
     def _apply_search_filter(self, *args):
-        """Apply search filter to both List and Tree views."""
-        # Guard: may fire during __init__ before available_files exists
         if not hasattr(self, "available_files"):
             return
 
@@ -917,7 +894,6 @@ class App(tk.Tk):
         )
 
     def _refresh_list_view(self):
-        """Repopulate the Listbox with filtered files, preserving selection."""
         root_dir = pathlib.Path(self.src_entry.get().strip()).expanduser().resolve()
         self.file_listbox.delete(0, tk.END)
 
@@ -933,32 +909,27 @@ class App(tk.Tk):
             except ValueError:
                 display = f"{f.name} ({human_readable_size(f.stat().st_size)})"
             self.file_listbox.insert(tk.END, display)
-            # Restore selection
             if f in self.selected_files:
                 self.file_listbox.selection_set(i)
 
     def _refresh_tree_view(self):
-        """Repopulate the Tree with filtered files, preserving selection."""
         root_dir = pathlib.Path(self.src_entry.get().strip()).expanduser().resolve()
         files_to_show = (
             self._filtered_files if self._search_active else self.available_files
         )
         self._populate_tree(root_dir, files_to_show)
 
-        # Restore selection in tree
         for item_id, path in self.file_tree._item_to_path.items():
             if path in self.selected_files:
                 self.file_tree._set_state(item_id, self.file_tree.TAG_CHECKED)
             else:
                 self.file_tree._set_state(item_id, self.file_tree.TAG_UNCHECKED)
 
-        # Update parent folders
         for item_id in self.file_tree._get_all_items():
             if self.file_tree._item_types.get(item_id) == "folder":
                 self.file_tree._update_parents(item_id)
 
     def _clear_search(self):
-        """Clear search and reset filter."""
         self._search_var.set("")
         self._search_entry.delete(0, tk.END)
         self._search_entry.insert(0, "Type to filter files...")
@@ -1001,7 +972,7 @@ class App(tk.Tk):
             self.limit_counter_label.config(text="No limits set", fg="gray")
             return
         total_chars = (
-            sum(f.stat().st_size for f in self.available_files if f.exists()) + 500
+                sum(f.stat().st_size for f in self.available_files if f.exists()) + 500
         )
         parts, color = [], "green"
         eff = limits.effective_max_chars()
@@ -1061,104 +1032,50 @@ class App(tk.Tk):
                 self.exclude_entry.delete(0, tk.END)
                 self.exclude_entry.insert(0, ", ".join(parts))
 
-    # ── List ──
+    # ── List & Tree Selection Logic (SSOT) ──
 
-    def select_all(self):
-        """Select all visible files in both List and Tree."""
-        self._syncing_selection = True
-        try:
-            files_to_show = (
-                self._filtered_files if self._search_active else self.available_files
-            )
-            self.selected_files.update(files_to_show)
-
-            # Update List
-            self.file_listbox.selection_clear(0, tk.END)
-            self.file_listbox.selection_set(0, tk.END)
-
-            # Update Tree
-            self._sync_selection_to_tree(files_to_show)
-            self._update_selection_stats()
-        finally:
-            self._syncing_selection = False
-
-    def deselect_all(self):
-        """Deselect all visible files in both List and Tree."""
-        self._syncing_selection = True
-        try:
-            files_to_show = (
-                self._filtered_files if self._search_active else self.available_files
-            )
-            self.selected_files.difference_update(files_to_show)
-
-            # Update List
-            self.file_listbox.selection_clear(0, tk.END)
-
-            # Update Tree
-            self._sync_selection_to_tree(files_to_show)
-            self._update_selection_stats()
-        finally:
-            self._syncing_selection = False
-
-    def invert_selection(self):
-        """Invert selection: selected ↔ unselected in both tabs."""
-        self._syncing_selection = True
-        try:
-            files_to_show = (
-                self._filtered_files if self._search_active else self.available_files
-            )
-
-            # Инвертируем только видимые файлы с помощью XOR
-            self.selected_files ^= set(files_to_show)
-
-            # Update List
-            self.file_listbox.selection_clear(0, tk.END)
-            for i, f in enumerate(files_to_show):
-                if f in self.selected_files:
-                    self.file_listbox.selection_set(i)
-
-            # Update Tree
-            self._sync_selection_to_tree(files_to_show)
-            self._update_selection_stats()
-        finally:
-            self._syncing_selection = False
-
-    def deselect_all(self):
-        """Deselect all files in both List and Tree."""
-        self.selected_files.clear()
-
-        # Update List
-        self.file_listbox.selection_clear(0, tk.END)
-
-        # Update Tree
-        self.file_tree.uncheck_all()
-
-        self._update_selection_stats()
-
-    def invert_selection(self):
-        """Invert selection: selected ↔ unselected in both tabs."""
-        files_to_show = (
-            self._filtered_files if self._search_active else self.available_files
-        )
-        self.selected_files = {f for f in files_to_show if f not in self.selected_files}
-
-        # Update List
+    def _update_ui_from_state(self, files_to_show: List[pathlib.Path]):
+        """Синхронизирует Listbox и Tree с эталонным state (self.selected_files)."""
+        # Sync Listbox
         self.file_listbox.selection_clear(0, tk.END)
         for i, f in enumerate(files_to_show):
             if f in self.selected_files:
                 self.file_listbox.selection_set(i)
 
-        # Update Tree
-        for item_id, path in self.file_tree._item_to_path.items():
-            if path in self.selected_files:
-                self.file_tree._set_state(item_id, self.file_tree.TAG_CHECKED)
-            else:
-                self.file_tree._set_state(item_id, self.file_tree.TAG_UNCHECKED)
-        for item_id in self.file_tree._get_all_items():
-            if self.file_tree._item_types.get(item_id) == "folder":
-                self.file_tree._update_parents(item_id)
-
+        # Sync Tree
+        self._sync_selection_to_tree(files_to_show)
         self._update_selection_stats()
+
+    def select_all(self):
+        """Выделяет все ВИДИМЫЕ файлы (остальные не трогает)."""
+        self._syncing_selection = True
+        try:
+            files_to_show = self._filtered_files if self._search_active else self.available_files
+            self.selected_files.update(files_to_show)
+            self._update_ui_from_state(files_to_show)
+        finally:
+            self._syncing_selection = False
+
+    def deselect_all(self):
+        """Снимает выделение со всех ВИДИМЫХ файлов (остальные не трогает)."""
+        self._syncing_selection = True
+        try:
+            files_to_show = self._filtered_files if self._search_active else self.available_files
+            self.selected_files.difference_update(files_to_show)
+            self._update_ui_from_state(files_to_show)
+        finally:
+            self._syncing_selection = False
+
+    def invert_selection(self):
+        """Инвертирует выделение ТОЛЬКО для видимых файлов (XOR)."""
+        self._syncing_selection = True
+        try:
+            files_to_show = self._filtered_files if self._search_active else self.available_files
+            # XOR (симметричная разность) идеально подходит для инверсии
+            self.selected_files ^= set(files_to_show)
+            self._update_ui_from_state(files_to_show)
+        finally:
+            self._syncing_selection = False
 
     def remove_unselected(self):
         """Remove all unselected files, keep only selected ones."""
@@ -1229,7 +1146,10 @@ class App(tk.Tk):
         else:
             self._drag_mode = True
             self.file_listbox.selection_set(idx)
-        self._update_selection_stats()
+
+        # ПРИНУДИТЕЛЬНАЯ СИНХРОНИЗАЦИЯ:
+        # Сразу записываем визуальный клик в память (self.selected_files)
+        self._on_listbox_select(None)
         return "break"
 
     def _on_list_drag(self, event):
@@ -1249,7 +1169,10 @@ class App(tk.Tk):
             else:
                 self.file_listbox.selection_clear(i)
         self._drag_last_index = cur
-        self._update_selection_stats()
+
+        # ПРИНУДИТЕЛЬНАЯ СИНХРОНИЗАЦИЯ:
+        # Записываем изменения от протягивания мышью в память в реальном времени
+        self._on_listbox_select(None)
         return "break"
 
     def _on_list_release(self, event):
@@ -1259,16 +1182,20 @@ class App(tk.Tk):
         self._update_selection_stats()
 
     def _on_listbox_select(self, event):
-        """Sync selected_files whenever listbox selection changes."""
+        """Синхронизирует эталонный state при ручном клике в Listbox."""
         if self._syncing_selection:
             return
-        files_to_show = (
-            self._filtered_files if self._search_active else self.available_files
-        )
+
+        files_to_show = self._filtered_files if self._search_active else self.available_files
         indices = self.file_listbox.curselection()
-        self.selected_files = {
-            files_to_show[i] for i in indices if i < len(files_to_show)
-        }
+
+        # 1. Удаляем все текущие ВИДИМЫЕ файлы из эталонного state
+        self.selected_files.difference_update(files_to_show)
+
+        # 2. Добавляем обратно только те, которые сейчас реально выделены в Listbox
+        selected_visible = {files_to_show[i] for i in indices if i < len(files_to_show)}
+        self.selected_files.update(selected_visible)
+
         self._update_selection_stats()
 
     def load_files_to_listbox(self):
@@ -1342,10 +1269,19 @@ class App(tk.Tk):
             )
 
     def _on_tree_check_changed(self, event):
-        """Handle checkbox state change in tree."""
+        """Синхронизирует эталонный state при клике по чекбоксу в Tree."""
         if self._syncing_selection:
             return
-        self.selected_files = set(self.file_tree.get_checked_files())
+
+        files_to_show = self._filtered_files if self._search_active else self.available_files
+
+        # 1. Удаляем все текущие ВИДИМЫЕ файлы из эталонного state
+        self.selected_files.difference_update(files_to_show)
+
+        # 2. Добавляем обратно только те, которые отмечены в Tree
+        checked_in_tree = set(self.file_tree.get_checked_files())
+        self.selected_files.update(checked_in_tree)
+
         self._update_selection_stats()
 
     def _on_tab_changed(self, event):
@@ -1358,9 +1294,8 @@ class App(tk.Tk):
         )
 
         if current == 0:
-            # Tree → List: sync from tree checked files to listbox selection
+            # Tree → List
             self._syncing_selection = True
-            self.selected_files = set(self.file_tree.get_checked_files())
             self.file_listbox.selection_clear(0, tk.END)
             for i, f in enumerate(files_to_show):
                 if f in self.selected_files:
@@ -1368,13 +1303,8 @@ class App(tk.Tk):
             self._update_selection_stats()
             self._syncing_selection = False
         else:
-            # List → Tree: sync from listbox selection to tree checkboxes
+            # List → Tree
             self._syncing_selection = True
-            list_selected_indices = self.file_listbox.curselection()
-            list_selected_files = {files_to_show[i] for i in list_selected_indices}
-            self.selected_files = list_selected_files
-
-            # Update tree checkboxes based on selected_files
             self._sync_selection_to_tree(files_to_show)
             self._update_selection_stats()
             self._syncing_selection = False
@@ -1447,6 +1377,9 @@ class App(tk.Tk):
         files_to_process = (
             self._filtered_files if self._search_active else self.available_files
         )
+        # Apply selection mask
+        files_to_process = [f for f in files_to_process if f in self.selected_files]
+
         asyncio.run_coroutine_threadsafe(
             self._run_generation(
                 s.source, s.extensions, s.exclude, s.output, limits, files_to_process
@@ -1455,7 +1388,7 @@ class App(tk.Tk):
         )
 
     async def _run_generation(
-        self, root, exts, excludes, out_name, limits, files_to_process=None
+            self, root, exts, excludes, out_name, limits, files_to_process=None
     ):
         if files_to_process is None:
             files_to_process = self.available_files
