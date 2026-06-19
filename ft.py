@@ -51,7 +51,11 @@ def _safe_tar_members(tar, output_dir):
         if not _is_path_inside(output_root, member_target):
             raise ValueError("Архив содержит небезопасный путь: {}".format(member.name))
         if member.issym() or member.islnk():
-            raise ValueError("Архив содержит ссылку, распаковка ссылок отключена: {}".format(member.name))
+            raise ValueError(
+                "Архив содержит ссылку, распаковка ссылок отключена: {}".format(
+                    member.name
+                )
+            )
         yield member
 
 
@@ -73,7 +77,9 @@ def build_token(source):
         "archive": "tar.xz",
         "version": 1,
     }
-    meta_bytes = json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    meta_bytes = json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
 
     payload = len(meta_bytes).to_bytes(4, "big") + meta_bytes + archive_bytes
     payload_hash = sha256_bytes(payload)
@@ -114,8 +120,8 @@ def decode_token(token):
     if len(payload) < 4 + meta_len:
         raise ValueError("Пакет поврежден: метаданные обрезаны")
 
-    meta_bytes = payload[4:4 + meta_len]
-    archive_bytes = payload[4 + meta_len:]
+    meta_bytes = payload[4 : 4 + meta_len]
+    archive_bytes = payload[4 + meta_len :]
 
     meta = json.loads(meta_bytes.decode("utf-8"))
     return meta, archive_bytes
@@ -139,9 +145,7 @@ def try_set_clipboard(text):
 
         if shutil.which("xclip"):
             proc = subprocess.Popen(
-                ["xclip", "-selection", "clipboard"],
-                stdin=subprocess.PIPE,
-                text=True
+                ["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE, text=True
             )
             proc.communicate(text)
             if proc.returncode == 0:
@@ -149,9 +153,7 @@ def try_set_clipboard(text):
 
         if shutil.which("xsel"):
             proc = subprocess.Popen(
-                ["xsel", "--clipboard", "--input"],
-                stdin=subprocess.PIPE,
-                text=True
+                ["xsel", "--clipboard", "--input"], stdin=subprocess.PIPE, text=True
             )
             proc.communicate(text)
             if proc.returncode == 0:
@@ -171,16 +173,14 @@ def try_get_clipboard():
             result = subprocess.check_output(
                 ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
                 text=True,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
             )
             if result.strip():
                 return result
 
         if shutil.which("wl-paste"):
             result = subprocess.check_output(
-                ["wl-paste", "-n"],
-                text=True,
-                stderr=subprocess.DEVNULL
+                ["wl-paste", "-n"], text=True, stderr=subprocess.DEVNULL
             )
             if result.strip():
                 return result
@@ -189,7 +189,7 @@ def try_get_clipboard():
             result = subprocess.check_output(
                 ["xclip", "-selection", "clipboard", "-o"],
                 text=True,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
             )
             if result.strip():
                 return result
@@ -198,7 +198,7 @@ def try_get_clipboard():
             result = subprocess.check_output(
                 ["xsel", "--clipboard", "--output"],
                 text=True,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
             )
             if result.strip():
                 return result
@@ -368,6 +368,12 @@ def launch_web(port=5000):
         <div class="container">
             <h1>FT Transfer</h1>
             
+            <div style="margin: 15px 0; padding: 12px; background: #f0f4ff; border-radius: 6px; border: 1px solid #d0d9f0;">
+                <label style="display: flex; align-items: center; gap: 8px; margin: 0; font-size: 13px; text-transform: none; color: #172b4d;">
+                    <input type="checkbox" id="autoMode" checked> Автоматический режим: распознавание при вставке
+                </label>
+            </div>
+            
             <div class="section">
                 <h2>Упаковка (Pack)</h2>
                 
@@ -434,18 +440,17 @@ def launch_web(port=5000):
                 const ta = document.getElementById(elementId);
                 try {
                     await navigator.clipboard.writeText(ta.value);
-                    const originalText = btn.innerText;
-                    btn.innerText = 'Скопировано!';
-                    btn.style.backgroundColor = '#36b37e';
-                    setTimeout(() => {
-                        btn.innerText = originalText;
-                        btn.style.backgroundColor = '#6b778c';
-                    }, 2000);
                 } catch (err) {
                     ta.select();
                     document.execCommand('copy');
-                    alert('Скопировано в буфер обмена');
                 }
+                const originalText = btn.innerText;
+                btn.innerText = 'Скопировано!';
+                btn.style.backgroundColor = '#36b37e';
+                setTimeout(() => {
+                    btn.innerText = originalText;
+                    btn.style.backgroundColor = '#6b778c';
+                }, 2000);
             };
 
             window.downloadOutToken = function() {
@@ -608,6 +613,97 @@ def launch_web(port=5000):
                     loader.style.display = 'none';
                 }
             }
+
+            // ===== AUTO-MODE: debounce + auto-pack + auto-unpack =====
+            function _debounce(key, ms, fn) {
+                clearTimeout(window[key]);
+                window[key] = setTimeout(fn, ms);
+            }
+
+            async function autoPack() {
+                if (!document.getElementById('autoMode').checked) return;
+                const textContent = document.getElementById('packTextContent').value.trim();
+                if (!textContent) return;
+                if (document.getElementById('packFile').files.length > 0) return;
+                if (document.getElementById('packFolder').files.length > 0) return;
+
+                const textName = document.getElementById('packTextName').value.trim() || 'pasted_text.txt';
+                const loader = document.getElementById('packLoader');
+                loader.style.display = 'block';
+                try {
+                    const payload = { is_folder: false, is_text: true, filename: textName, text_content: textContent };
+                    const res = await fetch('/api/pack', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    const data = await res.json();
+                    if (data.error) throw new Error(data.error);
+                    window.currentExportToken = data.token;
+                    window.currentExportFilename = data.filename;
+                    const html = `
+                        <div style="margin-bottom: 10px; font-weight: bold; color: #006644;">Токен (${data.filename}):</div>
+                        <textarea id="outTokenArea" rows="6" readonly style="width: 100%; margin-bottom: 10px; font-family: monospace; cursor: text;"></textarea>
+                        <div class="flex-actions">
+                            <button class="btn-secondary" onclick="copyTextElement(this, 'outTokenArea')">Скопировать токен</button>
+                            <button class="btn-secondary" onclick="downloadOutToken()">Скачать .ft.txt</button>
+                        </div>
+                    `;
+                    showResult('packResult', 'success', html);
+                    document.getElementById('outTokenArea').value = data.token;
+                } catch (err) {
+                    // Auto: silently ignore errors
+                } finally {
+                    loader.style.display = 'none';
+                }
+            }
+
+            async function autoUnpack() {
+                if (!document.getElementById('autoMode').checked) return;
+                const tokenText = document.getElementById('unpackText').value.trim();
+                if (!tokenText) return;
+                if (!tokenText.includes('FTPKG1.')) return;
+                if (document.getElementById('unpackFile').files.length > 0) return;
+
+                const loader = document.getElementById('unpackLoader');
+                loader.style.display = 'block';
+                try {
+                    const res = await fetch('/api/unpack', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ token: tokenText })
+                    });
+                    const data = await res.json();
+                    if (data.error) return;
+                    let resultHtml = `Данные восстановлены:<br><b style="color:#172b4d;">${data.path}</b>`;
+                    if (data.is_text && data.text_content !== null) {
+                        const trunc = data.text_truncated ? '<div class="text-muted">Предпросмотр обрезан.</div>' : '';
+                        resultHtml += `
+                            <div style="margin-top: 15px; font-weight: bold; color: #006644;">Содержимое:</div>
+                            ${trunc}
+                            <textarea id="unpackedContentArea" rows="10" readonly style="width: 100%; margin-top: 8px; margin-bottom: 10px; font-family: monospace; cursor: text;"></textarea>
+                            <div>
+                                <button class="btn-secondary" onclick="copyTextElement(this, 'unpackedContentArea')">Скопировать текст</button>
+                            </div>
+                        `;
+                        showResult('unpackResult', 'success', resultHtml);
+                        document.getElementById('unpackedContentArea').value = data.text_content;
+                    } else {
+                        showResult('unpackResult', 'success', resultHtml);
+                    }
+                } catch (err) {
+                    // Auto: silently ignore errors
+                } finally {
+                    loader.style.display = 'none';
+                }
+            }
+
+            document.getElementById('packTextContent').addEventListener('input', function() {
+                _debounce('_packAuto', 800, autoPack);
+            });
+            document.getElementById('unpackText').addEventListener('input', function() {
+                _debounce('_unpackAuto', 800, autoUnpack);
+            });
         </script>
     </body>
     </html>
@@ -619,48 +715,62 @@ def launch_web(port=5000):
 
         def _send_json(self, data, status=200):
             self.send_response(status)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
-            self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+            self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
         def do_GET(self):
-            if self.path == '/':
+            if self.path == "/":
                 self.send_response(200)
-                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.send_header("Content-type", "text/html; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(HTML_TEMPLATE.encode('utf-8'))
+                self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
             else:
                 self.send_response(404)
                 self.end_headers()
 
         def do_POST(self):
-            if self.path not in ['/api/pack', '/api/unpack']:
+            if self.path not in ["/api/pack", "/api/unpack"]:
                 return self._send_json({"error": "Not Found"}, 404)
 
             try:
-                content_length = int(self.headers.get('Content-Length', 0))
+                content_length = int(self.headers.get("Content-Length", 0))
                 if content_length == 0:
                     return self._send_json({"error": "Empty body"}, 400)
 
-                body = self.rfile.read(content_length).decode('utf-8')
+                body = self.rfile.read(content_length).decode("utf-8")
                 data = json.loads(body)
             except Exception as e:
-                return self._send_json({"error": f"Ошибка обработки запроса (возможно превышен лимит): {e}"}, 400)
+                return self._send_json(
+                    {
+                        "error": f"Ошибка обработки запроса (возможно превышен лимит): {e}"
+                    },
+                    400,
+                )
 
-            if self.path == '/api/pack':
+            if self.path == "/api/pack":
                 try:
                     with tempfile.TemporaryDirectory(prefix="ft_web_pack_") as tmp_dir:
-                        if data.get('is_folder'):
-                            folder_name = data.get('folder_name', 'packed_folder')
+                        if data.get("is_folder"):
+                            folder_name = (
+                                Path(data.get("folder_name", "packed_folder")).name
+                                or "packed_folder"
+                            )
                             source_path = Path(tmp_dir) / folder_name
                             source_path.mkdir(parents=True, exist_ok=True)
 
-                            for f in data.get('files', []):
-                                file_rel_path = f.get('path', '')
+                            for f in data.get("files", []):
+                                file_rel_path = f.get("path", "")
                                 if not file_rel_path:
                                     continue
 
-                                safe_parts = [p for p in Path(file_rel_path).parts if p not in ('', '.', '..') and not p.startswith('\\') and not p.startswith('/')]
+                                safe_parts = [
+                                    p
+                                    for p in Path(file_rel_path).parts
+                                    if p not in ("", ".", "..")
+                                    and not p.startswith("\\")
+                                    and not p.startswith("/")
+                                ]
                                 if not safe_parts:
                                     continue
 
@@ -668,32 +778,36 @@ def launch_web(port=5000):
                                 full_path.parent.mkdir(parents=True, exist_ok=True)
 
                                 try:
-                                    full_path.write_bytes(base64.b64decode(f.get('b64', '')))
+                                    full_path.write_bytes(
+                                        base64.b64decode(f.get("b64", ""))
+                                    )
                                 except Exception as write_err:
-                                    print(f"Skipping file {full_path}: {write_err}", file=sys.stderr)
+                                    print(
+                                        f"Skipping file {full_path}: {write_err}",
+                                        file=sys.stderr,
+                                    )
                                     continue
 
                         else:
-                            filename = data.get('filename', 'file')
+                            filename = Path(data.get("filename", "file")).name or "file"
                             source_path = Path(tmp_dir) / filename
 
-                            if data.get('is_text'):
-                                source_path.write_text(data.get('text_content', ''), encoding='utf-8')
+                            if data.get("is_text"):
+                                source_path.write_text(
+                                    data.get("text_content", ""), encoding="utf-8"
+                                )
                             else:
-                                b64 = data.get('content_b64', '')
+                                b64 = data.get("content_b64", "")
                                 source_path.write_bytes(base64.b64decode(b64))
 
                         token = build_token(source_path)
 
-                    self._send_json({
-                        "token": token,
-                        "filename": source_path.name
-                    })
+                    self._send_json({"token": token, "filename": source_path.name})
                 except Exception as exc:
                     self._send_json({"error": str(exc)}, 500)
 
-            elif self.path == '/api/unpack':
-                raw_text = data.get('token', '')
+            elif self.path == "/api/unpack":
+                raw_text = data.get("token", "")
                 if not raw_text.strip():
                     return self._send_json({"error": "Токен пуст"}, 400)
 
@@ -716,19 +830,23 @@ def launch_web(port=5000):
                     text_truncated = False
                     if restored_path.is_file():
                         try:
-                            is_text, text_content, text_truncated, _ = read_text_preview(restored_path)
+                            is_text, text_content, text_truncated, _ = (
+                                read_text_preview(restored_path)
+                            )
                             if not is_text:
                                 text_content = None
                         except Exception:
                             text_content = None
 
-                    self._send_json({
-                        "status": "ok",
-                        "path": str(restored_path.resolve()),
-                        "is_text": is_text,
-                        "text_content": text_content,
-                        "text_truncated": text_truncated
-                    })
+                    self._send_json(
+                        {
+                            "status": "ok",
+                            "path": str(restored_path.resolve()),
+                            "is_text": is_text,
+                            "text_content": text_content,
+                            "text_truncated": text_truncated,
+                        }
+                    )
                 except Exception as exc:
                     self._send_json({"error": str(exc)}, 400)
 
@@ -736,12 +854,17 @@ def launch_web(port=5000):
         daemon_threads = True
 
     try:
-        server = ThreadingHTTPServer(('0.0.0.0', port), FTRequestHandler)
-        print(f"[*] Запуск Zero-Dependency Web-сервера FT Transfer на http://0.0.0.0:{port}")
+        server = ThreadingHTTPServer(("0.0.0.0", port), FTRequestHandler)
+        print(
+            f"[*] Запуск Zero-Dependency Web-сервера FT Transfer на http://0.0.0.0:{port}"
+        )
         print("[*] Нажмите Ctrl+C для остановки")
         server.serve_forever()
     except OSError as e:
-        print(f"Ошибка: Не удалось запустить сервер на порту {port}. Порт занят? ({e})", file=sys.stderr)
+        print(
+            f"Ошибка: Не удалось запустить сервер на порту {port}. Порт занят? ({e})",
+            file=sys.stderr,
+        )
         return 1
     except KeyboardInterrupt:
         print("\n[*] Сервер остановлен.")
@@ -768,13 +891,16 @@ def launch_gui():
             self.pack_source_var = tk.StringVar()
             self.pack_output_var = tk.StringVar()
             self.pack_text_name_var = tk.StringVar(value="pasted_text.txt")
-            self.pack_copy_var = tk.BooleanVar(value=True)
             self.unpack_input_var = tk.StringVar()
-            self.unpack_output_var = tk.StringVar(value=str((Path.cwd() / "restored").resolve()))
+            self.unpack_output_var = tk.StringVar(
+                value=str((Path.cwd() / "restored").resolve())
+            )
             self.status_var = tk.StringVar(value="Готово")
             self.busy = False
             self.last_unpacked_path = None
             self.unpack_preview_text_cache = ""
+            # Автоматический режим — включён по умолчанию
+            self.auto_mode_var = tk.BooleanVar(value=True)
 
             self._configure_style()
             self._build_ui()
@@ -785,12 +911,29 @@ def launch_gui():
                 style.theme_use("clam")
             except tk.TclError:
                 pass
-            style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"), padding=(0, 0, 0, 4))
-            style.configure("Subtitle.TLabel", font=("Segoe UI", 10), foreground="#5c6470")
+            style.configure(
+                "Title.TLabel", font=("Segoe UI", 18, "bold"), padding=(0, 0, 0, 4)
+            )
+            style.configure(
+                "Subtitle.TLabel", font=("Segoe UI", 10), foreground="#5c6470"
+            )
             style.configure("Section.TLabelframe.Label", font=("Segoe UI", 10, "bold"))
-            style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"), padding=(12, 8))
+            style.configure(
+                "Accent.TButton", font=("Segoe UI", 10, "bold"), padding=(12, 8)
+            )
             style.configure("TButton", padding=(8, 5))
             style.configure("TEntry", padding=5)
+            style.configure(
+                "Copied.TButton",
+                font=("Segoe UI", 9, "bold"),
+                foreground="white",
+                background="#36b37e",
+                padding=(8, 5),
+            )
+            style.map(
+                "Copied.TButton",
+                background=[("active", "#2e9e6a"), ("disabled", "#a5d6b8")],
+            )
 
         def _build_ui(self):
             root = ttk.Frame(self, padding=18)
@@ -800,8 +943,17 @@ def launch_gui():
             ttk.Label(
                 root,
                 text="Удобная упаковка файлов, папок и вставленного текста в FTPKG-токен и восстановление обратно.",
-                style="Subtitle.TLabel"
-            ).pack(anchor="w", pady=(0, 14))
+                style="Subtitle.TLabel",
+            ).pack(anchor="w", pady=(0, 6))
+
+            # Галочка автоматического режима (общая для обеих вкладок)
+            auto_frame = ttk.Frame(root)
+            auto_frame.pack(fill="x", pady=(0, 10))
+            ttk.Checkbutton(
+                auto_frame,
+                text="Автоматический режим: пересчёт токена и распаковка при вставке текста",
+                variable=self.auto_mode_var,
+            ).pack(anchor="w")
 
             notebook = ttk.Notebook(root)
             notebook.pack(fill="both", expand=True)
@@ -821,103 +973,167 @@ def launch_gui():
             ttk.Label(bottom, textvariable=self.status_var).pack(side="right")
 
         def _build_pack_tab(self):
-            source_box = ttk.Labelframe(self.pack_tab, text="Что упаковать", style="Section.TLabelframe")
+            source_box = ttk.Labelframe(
+                self.pack_tab, text="Что упаковать", style="Section.TLabelframe"
+            )
             source_box.pack(fill="x")
             self._path_row(
                 source_box,
                 "Файл или папка:",
                 self.pack_source_var,
-                [("Файл", self._choose_pack_file), ("Папка", self._choose_pack_dir)]
+                [("Файл", self._choose_pack_file), ("Папка", self._choose_pack_dir)],
             )
             self._path_row(
                 source_box,
                 "Куда сохранить .ft.txt:",
                 self.pack_output_var,
-                [("Выбрать", self._choose_pack_output)]
+                [("Выбрать", self._choose_pack_output)],
             )
-            ttk.Checkbutton(
-                source_box,
-                text="Скопировать токен в буфер обмена после упаковки",
-                variable=self.pack_copy_var
-            ).pack(anchor="w", padx=12, pady=(0, 10))
-
-            text_box = ttk.Labelframe(self.pack_tab, text="Или вставьте текст без выбора файла", style="Section.TLabelframe")
+            text_box = ttk.Labelframe(
+                self.pack_tab,
+                text="Или вставьте текст без выбора файла",
+                style="Section.TLabelframe",
+            )
             text_box.pack(fill="both", expand=True, pady=(12, 0))
             name_row = ttk.Frame(text_box, padding=(10, 8, 10, 0))
             name_row.pack(fill="x")
             ttk.Label(name_row, text="Имя файла в пакете:", width=22).pack(side="left")
-            ttk.Entry(name_row, textvariable=self.pack_text_name_var).pack(side="left", fill="x", expand=True)
+            ttk.Entry(name_row, textvariable=self.pack_text_name_var).pack(
+                side="left", fill="x", expand=True
+            )
             ttk.Label(
                 text_box,
                 text="Если поле ниже не пустое, будет упакован этот текст как обычный .txt-файл.",
-                style="Subtitle.TLabel"
+                style="Subtitle.TLabel",
             ).pack(anchor="w", padx=10, pady=(6, 0))
-            self.pack_text = scrolledtext.ScrolledText(text_box, wrap="word", height=12, undo=True)
+            self.pack_text = scrolledtext.ScrolledText(
+                text_box, wrap="word", height=12, undo=True
+            )
             self.pack_text.pack(fill="both", expand=True, padx=10, pady=(8, 8))
+            # Автоупаковка при вводе текста
+            self.pack_text.bind("<KeyRelease>", self._on_pack_text_changed)
 
             text_actions = ttk.Frame(text_box)
             text_actions.pack(fill="x", padx=10, pady=(0, 10))
-            ttk.Button(text_actions, text="Вставить из буфера", command=self._paste_pack_clipboard).pack(side="left")
-            ttk.Button(text_actions, text="Очистить текст", command=self._clear_pack_text).pack(side="left", padx=(8, 0))
+            ttk.Button(
+                text_actions,
+                text="Вставить из буфера",
+                command=self._paste_pack_clipboard,
+            ).pack(side="left")
+            ttk.Button(
+                text_actions, text="Очистить текст", command=self._clear_pack_text
+            ).pack(side="left", padx=(8, 0))
 
             actions = ttk.Frame(self.pack_tab)
             actions.pack(fill="x", pady=(12, 8))
-            ttk.Button(actions, text="Упаковать", style="Accent.TButton", command=self._pack_clicked).pack(side="left")
-            ttk.Button(actions, text="Очистить", command=self._clear_pack).pack(side="left", padx=(8, 0))
-            ttk.Button(actions, text="Открыть папку результата", command=self._open_pack_output_folder).pack(side="right")
+            ttk.Button(
+                actions,
+                text="Упаковать",
+                style="Accent.TButton",
+                command=self._pack_clicked,
+            ).pack(side="left")
+            ttk.Button(actions, text="Очистить", command=self._clear_pack).pack(
+                side="left", padx=(8, 0)
+            )
+            ttk.Button(
+                actions,
+                text="Открыть папку результата",
+                command=self._open_pack_output_folder,
+            ).pack(side="right")
 
-            preview_box = ttk.Labelframe(self.pack_tab, text="Готовый токен", style="Section.TLabelframe")
+            preview_box = ttk.Labelframe(
+                self.pack_tab, text="Готовый токен", style="Section.TLabelframe"
+            )
             preview_box.pack(fill="x", expand=False)
-            self.pack_preview = scrolledtext.ScrolledText(preview_box, wrap="word", height=4, undo=True)
+            self.pack_preview = scrolledtext.ScrolledText(
+                preview_box, wrap="word", height=4, undo=True
+            )
             self.pack_preview.pack(fill="both", expand=True, padx=10, pady=(8, 8))
 
             preview_actions = ttk.Frame(preview_box)
             preview_actions.pack(fill="x", padx=10, pady=(0, 10))
-            ttk.Button(preview_actions, text="Копировать токен", command=self._copy_pack_preview).pack(side="left")
-            ttk.Button(preview_actions, text="Сохранить как...", command=self._save_pack_preview_as).pack(side="left", padx=(8, 0))
+            self.copy_pack_preview_btn = ttk.Button(
+                preview_actions,
+                text="Копировать токен",
+                command=self._copy_pack_preview,
+            )
+            self.copy_pack_preview_btn.pack(side="left")
+            ttk.Button(
+                preview_actions,
+                text="Сохранить как...",
+                command=self._save_pack_preview_as,
+            ).pack(side="left", padx=(8, 0))
 
         def _build_unpack_tab(self):
-            input_box = ttk.Labelframe(self.unpack_tab, text="Откуда взять токен", style="Section.TLabelframe")
+            input_box = ttk.Labelframe(
+                self.unpack_tab, text="Откуда взять токен", style="Section.TLabelframe"
+            )
             input_box.pack(fill="x")
             self._path_row(
                 input_box,
                 "Файл .ft.txt:",
                 self.unpack_input_var,
-                [("Выбрать", self._choose_unpack_input), ("Загрузить", self._load_unpack_input_file)]
+                [
+                    ("Выбрать", self._choose_unpack_input),
+                    ("Загрузить", self._load_unpack_input_file),
+                ],
             )
             self._path_row(
                 input_box,
                 "Папка назначения:",
                 self.unpack_output_var,
-                [("Выбрать", self._choose_unpack_output)]
+                [("Выбрать", self._choose_unpack_output)],
             )
 
-            text_box = ttk.Labelframe(self.unpack_tab, text="Или вставьте токен / текст из Figma", style="Section.TLabelframe")
+            text_box = ttk.Labelframe(
+                self.unpack_tab,
+                text="Или вставьте токен / текст из Figma",
+                style="Section.TLabelframe",
+            )
             text_box.pack(fill="x", expand=False, pady=(12, 0))
-            self.unpack_text = scrolledtext.ScrolledText(text_box, wrap="word", height=6, undo=True)
+            self.unpack_text = scrolledtext.ScrolledText(
+                text_box, wrap="word", height=6, undo=True
+            )
             self.unpack_text.pack(fill="both", expand=True, padx=10, pady=(8, 8))
+            # Автораспаковка при вводе токена
+            self.unpack_text.bind("<KeyRelease>", self._on_unpack_text_changed)
 
             text_actions = ttk.Frame(text_box)
             text_actions.pack(fill="x", padx=10, pady=(0, 10))
-            ttk.Button(text_actions, text="Вставить из буфера", command=self._paste_unpack_clipboard).pack(side="left")
-            ttk.Button(text_actions, text="Очистить текст", command=self._clear_unpack_text).pack(side="left", padx=(8, 0))
-            ttk.Button(text_actions, text="Открыть папку назначения", command=self._open_unpack_output_folder).pack(side="right")
+            ttk.Button(
+                text_actions,
+                text="Вставить из буфера",
+                command=self._paste_unpack_clipboard,
+            ).pack(side="left")
+            ttk.Button(
+                text_actions, text="Очистить текст", command=self._clear_unpack_text
+            ).pack(side="left", padx=(8, 0))
+            ttk.Button(
+                text_actions,
+                text="Открыть папку назначения",
+                command=self._open_unpack_output_folder,
+            ).pack(side="right")
 
             actions = ttk.Frame(self.unpack_tab)
             actions.pack(fill="x", pady=(12, 0))
-            ttk.Button(actions, text="Распаковать", style="Accent.TButton", command=self._unpack_clicked).pack(side="left")
+            ttk.Button(
+                actions,
+                text="Распаковать",
+                style="Accent.TButton",
+                command=self._unpack_clicked,
+            ).pack(side="left")
             self.open_unpacked_btn = ttk.Button(
                 actions,
                 text="Открыть результат",
                 command=self._open_unpacked_path,
-                state="disabled"
+                state="disabled",
             )
             self.open_unpacked_btn.pack(side="right")
             self.copy_unpacked_result_btn = ttk.Button(
                 actions,
                 text="Копировать результат",
                 command=self._copy_unpack_preview,
-                state="disabled"
+                state="disabled",
             )
             self.copy_unpacked_result_btn.pack(side="right", padx=(0, 8))
             self.unpack_result_var = tk.StringVar(value="")
@@ -925,20 +1141,20 @@ def launch_gui():
                 side="left", fill="x", expand=True, padx=(12, 8)
             )
 
-            preview_box = ttk.Labelframe(self.unpack_tab, text="Просмотр результата", style="Section.TLabelframe")
+            preview_box = ttk.Labelframe(
+                self.unpack_tab, text="Просмотр результата", style="Section.TLabelframe"
+            )
             preview_box.pack(fill="both", expand=True, pady=(10, 0))
             self.unpack_preview_title_var = tk.StringVar(
                 value="После распаковки одиночного файла здесь появится предпросмотр."
             )
-            ttk.Label(preview_box, textvariable=self.unpack_preview_title_var, style="Subtitle.TLabel").pack(
-                anchor="w", padx=10, pady=(8, 0)
-            )
-            self.unpack_preview = scrolledtext.ScrolledText(
+            ttk.Label(
                 preview_box,
-                wrap="word",
-                height=16,
-                undo=False,
-                state="disabled"
+                textvariable=self.unpack_preview_title_var,
+                style="Subtitle.TLabel",
+            ).pack(anchor="w", padx=10, pady=(8, 0))
+            self.unpack_preview = scrolledtext.ScrolledText(
+                preview_box, wrap="word", height=16, undo=False, state="disabled"
             )
             self.unpack_preview.pack(fill="both", expand=True, padx=10, pady=(8, 8))
 
@@ -948,24 +1164,154 @@ def launch_gui():
                 preview_actions,
                 text="Копировать текст просмотра",
                 command=self._copy_unpack_preview,
-                state="disabled"
+                state="disabled",
             )
             self.copy_unpack_preview_btn.pack(side="left")
             self.save_unpacked_file_btn = ttk.Button(
                 preview_actions,
                 text="Сохранить копию файла...",
                 command=self._save_unpacked_file_as,
-                state="disabled"
+                state="disabled",
             )
             self.save_unpacked_file_btn.pack(side="left", padx=(8, 0))
 
+        # -----------------------------------------------------------------
+        # Вспомогательные методы debounce / статус
+        # -----------------------------------------------------------------
+        def _debounce(self, ms, func, attr_name="_debounce_id"):
+            if hasattr(self, attr_name):
+                self.after_cancel(getattr(self, attr_name))
+            setattr(self, attr_name, self.after(ms, func))
+
+        def _show_temporary_status(self, text, ms=1000):
+            self._set_status(text)
+            if hasattr(self, "_status_after_id"):
+                self.after_cancel(self._status_after_id)
+            self._status_after_id = self.after(ms, lambda: self._set_status("Готово"))
+
+        def _animate_button_copy(self, button):
+            """Показать анимацию «Скопировано!» на кнопке."""
+            original_text = button.cget("text")
+            # Сохраняем оригинальный стиль для корректного восстановления
+            original_style = button.cget("style") or "TButton"
+            button.configure(
+                text="✓ Скопировано!", style="Copied.TButton", state="disabled"
+            )
+            button.update_idletasks()
+
+            def restore():
+                button.configure(
+                    text=original_text, style=original_style, state="normal"
+                )
+
+            self.after(1500, restore)
+
+        # -----------------------------------------------------------------
+        # Автоупаковка
+        # -----------------------------------------------------------------
+        def _on_pack_text_changed(self, event=None):
+            if not self.auto_mode_var.get():
+                return
+            # Если начали печатать текст — сбрасываем выбор файла/папки
+            if self.pack_source_var.get().strip():
+                self.pack_source_var.set("")
+            self._debounce(800, self._auto_pack_text, "_pack_debounce_id")
+
+        def _auto_pack_text(self):
+            if not self.auto_mode_var.get() or self.busy:
+                return
+            pasted_text = self.pack_text.get("1.0", "end-1c").strip()
+            if not pasted_text:
+                return
+            if self.pack_source_var.get().strip():
+                return
+
+            text_file_name = self._get_pack_text_filename()
+
+            def work():
+                with tempfile.TemporaryDirectory(prefix="ft_gui_text_") as tmp_dir:
+                    source = Path(tmp_dir) / text_file_name
+                    save_text_file(source, pasted_text)
+                    token = build_token(source)
+                return token, text_file_name
+
+            def done(result):
+                token, name = result
+                self.pack_preview.delete("1.0", "end")
+                self.pack_preview.insert("1.0", token)
+                self._show_temporary_status("Авто: токен обновлён")
+
+            self._run_background("Автоупаковка...", work, done, silent=True)
+
+        # -----------------------------------------------------------------
+        # Автораспаковка
+        # -----------------------------------------------------------------
+        def _on_unpack_text_changed(self, event=None):
+            if not self.auto_mode_var.get():
+                return
+            # Если начали печатать токен — сбрасываем выбор файла
+            if self.unpack_input_var.get().strip():
+                self.unpack_input_var.set("")
+            self._debounce(800, self._auto_unpack_text, "_unpack_debounce_id")
+
+        def _auto_unpack_text(self):
+            if not self.auto_mode_var.get() or self.busy:
+                return
+            raw_text = self.unpack_text.get("1.0", "end-1c").strip()
+            if not raw_text:
+                return
+            if self.unpack_input_var.get().strip():
+                return
+
+            output_text = self.unpack_output_var.get().strip()
+            if not output_text:
+                return
+            target_dir = Path(output_text).resolve()
+
+            def work():
+                token = extract_token_from_text(raw_text)
+                meta, archive_bytes = decode_token(token)
+                extract_tar_xz(archive_bytes, target_dir)
+                restore_root = meta.get("root")
+                if restore_root:
+                    restored_path = target_dir / restore_root
+                elif "name" in meta:
+                    restored_path = target_dir / meta["name"]
+                else:
+                    restored_path = target_dir
+                return restored_path, meta
+
+            def done(result):
+                restored_path, meta = result
+                self._show_unpack_result(restored_path, "авто-вставка", meta)
+                if restored_path.is_file():
+                    is_text, text_content, truncated, size = read_text_preview(
+                        restored_path
+                    )
+                    if is_text and text_content:
+                        self._show_temporary_status("Авто: распаковано")
+                    else:
+                        self._show_temporary_status("Авто: файл распакован (бинарный)")
+                else:
+                    self._show_temporary_status("Авто: папка распакована")
+
+            self._clear_unpack_result_preview()
+            self._run_background("Автораспаковка...", work, done, silent=True)
+
+        # -----------------------------------------------------------------
+        # Остальные методы GUI
+        # -----------------------------------------------------------------
         def _path_row(self, parent, label, variable, buttons):
             row = ttk.Frame(parent, padding=(12, 10, 12, 4))
             row.pack(fill="x")
             ttk.Label(row, text=label, width=22).pack(side="left")
-            ttk.Entry(row, textvariable=variable).pack(side="left", fill="x", expand=True, padx=(0, 8))
+            ttk.Entry(row, textvariable=variable).pack(
+                side="left", fill="x", expand=True, padx=(0, 8)
+            )
             for text, command in buttons:
-                ttk.Button(row, text=text, command=command).pack(side="left", padx=(0, 4))
+                ttk.Button(row, text=text, command=command).pack(
+                    side="left", padx=(0, 4)
+                )
 
         def _choose_pack_file(self):
             path = filedialog.askopenfilename(title="Выберите файл для упаковки")
@@ -982,7 +1328,9 @@ def launch_gui():
             if hasattr(self, "pack_text"):
                 self.pack_text.delete("1.0", "end")
             source = Path(path)
-            self.pack_output_var.set(str((source.parent / "{}.ft.txt".format(source.name)).resolve()))
+            self.pack_output_var.set(
+                str((source.parent / "{}.ft.txt".format(source.name)).resolve())
+            )
 
         def _get_pack_text_filename(self):
             name = self.pack_text_name_var.get().strip() or "pasted_text.txt"
@@ -999,7 +1347,11 @@ def launch_gui():
                 initialfile=Path(initial).name if initial else "payload.ft.txt",
                 initialdir=str(Path(initial).parent) if initial else str(Path.cwd()),
                 defaultextension=".txt",
-                filetypes=[("FT token", "*.ft.txt"), ("Text files", "*.txt"), ("All files", "*.*")]
+                filetypes=[
+                    ("FT token", "*.ft.txt"),
+                    ("Text files", "*.txt"),
+                    ("All files", "*.*"),
+                ],
             )
             if path:
                 self.pack_output_var.set(path)
@@ -1007,10 +1359,17 @@ def launch_gui():
         def _choose_unpack_input(self):
             path = filedialog.askopenfilename(
                 title="Выберите файл с токеном",
-                filetypes=[("FT token", "*.ft.txt"), ("Text files", "*.txt"), ("All files", "*.*")]
+                filetypes=[
+                    ("FT token", "*.ft.txt"),
+                    ("Text files", "*.txt"),
+                    ("All files", "*.*"),
+                ],
             )
             if path:
                 self.unpack_input_var.set(path)
+                # Очищаем текстовое поле, чтобы авто-режим не конфликтовал
+                self.unpack_text.delete("1.0", "end")
+                self._clear_unpack_result_preview()
 
         def _choose_unpack_output(self):
             path = filedialog.askdirectory(title="Выберите папку назначения")
@@ -1041,7 +1400,9 @@ def launch_gui():
 
             path_text = self.unpack_input_var.get().strip()
             if path_text:
-                return read_text_file(Path(path_text)), "файл:{}".format(Path(path_text).resolve())
+                return read_text_file(Path(path_text)), "файл:{}".format(
+                    Path(path_text).resolve()
+                )
 
             try:
                 clipboard_text = self.clipboard_get()
@@ -1050,11 +1411,18 @@ def launch_gui():
             if clipboard_text.strip():
                 return clipboard_text, "буфер обмена"
 
-            raise ValueError("Нет текста для распаковки: вставьте токен, выберите файл или скопируйте токен в буфер")
+            raise ValueError(
+                "Нет текста для распаковки: вставьте токен, выберите файл или скопируйте токен в буфер"
+            )
 
         def _pack_clicked(self):
             if self.busy:
                 return
+
+            # Отменяем pending debounce автоупаковки, чтобы не перезаписала результат
+            if hasattr(self, "_pack_debounce_id"):
+                self.after_cancel(self._pack_debounce_id)
+                del self._pack_debounce_id
 
             pasted_text = self.pack_text.get("1.0", "end-1c")
             has_pasted_text = bool(pasted_text.strip())
@@ -1065,7 +1433,9 @@ def launch_gui():
             if has_pasted_text:
                 text_file_name = self._get_pack_text_filename()
                 if output_path is None:
-                    output_path = (Path.cwd() / "{}.ft.txt".format(text_file_name)).resolve()
+                    output_path = (
+                        Path.cwd() / "{}.ft.txt".format(text_file_name)
+                    ).resolve()
                     self.pack_output_var.set(str(output_path))
 
                 def work():
@@ -1075,10 +1445,17 @@ def launch_gui():
                         token = build_token(source)
                     if output_path:
                         save_text_file(output_path, token)
-                    return token, output_path, "вставленный текст ({})".format(text_file_name)
+                    return (
+                        token,
+                        output_path,
+                        "вставленный текст ({})".format(text_file_name),
+                    )
             else:
                 if not source_text:
-                    messagebox.showwarning("Не выбран источник", "Выберите файл/папку или вставьте текст для упаковки.")
+                    messagebox.showwarning(
+                        "Не выбран источник",
+                        "Выберите файл/папку или вставьте текст для упаковки.",
+                    )
                     return
                 source = Path(source_text).resolve()
                 if not source.exists():
@@ -1095,22 +1472,29 @@ def launch_gui():
                 token, saved_path, source_desc = result
                 self.pack_preview.delete("1.0", "end")
                 self.pack_preview.insert("1.0", token)
-                copied = False
-                if self.pack_copy_var.get():
-                    copied = self._copy_text_to_clipboard(token)
-                parts = ["Упаковка завершена", "{} символов".format(len(token)), "источник: {}".format(source_desc)]
+                # Автокопирование токена в буфер обмена + анимация кнопки
+                if self._copy_text_to_clipboard(token):
+                    self._animate_button_copy(self.copy_pack_preview_btn)
+                parts = [
+                    "Упаковка завершена",
+                    "{} символов".format(len(token)),
+                    "источник: {}".format(source_desc),
+                ]
                 if saved_path:
                     parts.append("файл: {}".format(saved_path))
-                if copied:
-                    parts.append("скопировано в буфер")
                 self._set_status("; ".join(parts))
-                messagebox.showinfo("Готово", "Токен создан{}.".format(" и скопирован в буфер" if copied else ""))
 
             self._run_background("Упаковка...", work, done)
 
         def _unpack_clicked(self):
             if self.busy:
                 return
+
+            # Отменяем pending debounce автораспаковки
+            if hasattr(self, "_unpack_debounce_id"):
+                self.after_cancel(self._unpack_debounce_id)
+                del self._unpack_debounce_id
+
             output_text = self.unpack_output_var.get().strip()
             if not output_text:
                 messagebox.showwarning("Не выбрана папка", "Выберите папку назначения.")
@@ -1153,7 +1537,9 @@ def launch_gui():
         def _clear_unpack_result_preview(self):
             self.last_unpacked_path = None
             self.unpack_result_var.set("")
-            self.unpack_preview_title_var.set("После распаковки одиночного файла здесь появится предпросмотр.")
+            self.unpack_preview_title_var.set(
+                "После распаковки одиночного файла здесь появится предпросмотр."
+            )
             self._set_unpack_preview_text("")
             self.open_unpacked_btn.configure(state="disabled")
             self.copy_unpacked_result_btn.configure(state="disabled")
@@ -1166,12 +1552,20 @@ def launch_gui():
             self.unpack_result_var.set("Восстановлено: {}".format(restored_path))
             self.open_unpacked_btn.configure(state="normal")
             self.copy_unpacked_result_btn.configure(state="normal")
-            self._set_status("Распаковка завершена; источник: {}; тип: {}".format(source_desc, meta.get("kind", "?")))
+            self._set_status(
+                "Распаковка завершена; источник: {}; тип: {}".format(
+                    source_desc, meta.get("kind", "?")
+                )
+            )
 
             if restored_path.is_file():
-                is_text, preview_text, truncated, size = read_text_preview(restored_path)
+                is_text, preview_text, truncated, size = read_text_preview(
+                    restored_path
+                )
                 size_label = self._format_bytes(size)
-                self.unpack_preview_title_var.set("Файл: {} | Размер: {}".format(restored_path.name, size_label))
+                self.unpack_preview_title_var.set(
+                    "Файл: {} | Размер: {}".format(restored_path.name, size_label)
+                )
                 self.save_unpacked_file_btn.configure(state="normal")
 
                 if is_text:
@@ -1194,15 +1588,21 @@ def launch_gui():
 
             if restored_path.is_dir():
                 files_count, dirs_count = self._count_folder_entries(restored_path)
-                self.unpack_preview_title_var.set("Папка: {}".format(restored_path.name))
+                self.unpack_preview_title_var.set(
+                    "Папка: {}".format(restored_path.name)
+                )
                 self._set_unpack_preview_text(
                     "Восстановлена папка. Предпросмотр содержимого включается только для одиночного файла.\n\n"
-                    "Путь: {}\nФайлов: {}\nПапок: {}".format(restored_path, files_count, dirs_count)
+                    "Путь: {}\nФайлов: {}\nПапок: {}".format(
+                        restored_path, files_count, dirs_count
+                    )
                 )
                 return
 
             self.unpack_preview_title_var.set("Результат распаковки")
-            self._set_unpack_preview_text("Путь результата не найден: {}".format(restored_path))
+            self._set_unpack_preview_text(
+                "Путь результата не найден: {}".format(restored_path)
+            )
 
         def _count_folder_entries(self, folder):
             files_count = 0
@@ -1220,22 +1620,26 @@ def launch_gui():
         def _copy_unpack_preview(self):
             text = self.unpack_preview_text_cache.strip()
             if not text:
-                messagebox.showwarning("Нет данных", "Нет текста для копирования.")
                 return
             if self._copy_text_to_clipboard(text):
-                self._set_status("Просмотр результата скопирован в буфер")
+                self._animate_button_copy(self.copy_unpacked_result_btn)
+                self._animate_button_copy(self.copy_unpack_preview_btn)
             else:
-                messagebox.showerror("Буфер недоступен", "Не удалось скопировать текст.")
+                messagebox.showerror(
+                    "Буфер недоступен", "Не удалось скопировать текст."
+                )
 
         def _save_unpacked_file_as(self):
             if not self.last_unpacked_path or not self.last_unpacked_path.is_file():
-                messagebox.showwarning("Нет файла", "Сначала распакуйте одиночный файл.")
+                messagebox.showwarning(
+                    "Нет файла", "Сначала распакуйте одиночный файл."
+                )
                 return
             path = filedialog.asksaveasfilename(
                 title="Сохранить копию восстановленного файла",
                 initialfile=self.last_unpacked_path.name,
                 initialdir=str(self.last_unpacked_path.parent),
-                filetypes=[("All files", "*.*")]
+                filetypes=[("All files", "*.*")],
             )
             if path:
                 shutil.copy2(self.last_unpacked_path, path)
@@ -1243,7 +1647,9 @@ def launch_gui():
 
         def _open_unpacked_path(self):
             if not self.last_unpacked_path:
-                messagebox.showwarning("Нет результата", "Сначала выполните распаковку.")
+                messagebox.showwarning(
+                    "Нет результата", "Сначала выполните распаковку."
+                )
                 return
             self._open_path(self.last_unpacked_path)
 
@@ -1256,7 +1662,7 @@ def launch_gui():
                 value /= 1024.0
             return "{:.1f} TB".format(value)
 
-        def _run_background(self, status, work, done):
+        def _run_background(self, status, work, done, silent=False):
             self.busy = True
             self._set_status(status)
             self.progress.start(12)
@@ -1268,16 +1674,19 @@ def launch_gui():
                 except Exception as exc:
                     result = None
                     error = exc
-                self.after(0, lambda: self._finish_background(result, error, done))
+                self.after(
+                    0, lambda: self._finish_background(result, error, done, silent)
+                )
 
             threading.Thread(target=runner, daemon=True).start()
 
-        def _finish_background(self, result, error, done):
+        def _finish_background(self, result, error, done, silent=False):
             self.progress.stop()
             self.busy = False
             if error:
                 self._set_status("Ошибка: {}".format(error))
-                messagebox.showerror("Ошибка", str(error))
+                if not silent:
+                    messagebox.showerror("Ошибка", str(error))
                 return
             done(result)
 
@@ -1293,22 +1702,29 @@ def launch_gui():
         def _copy_pack_preview(self):
             text = self.pack_preview.get("1.0", "end").strip()
             if not text:
-                messagebox.showwarning("Нет токена", "Сначала упакуйте файл, папку или текст.")
                 return
             if self._copy_text_to_clipboard(text):
-                self._set_status("Токен скопирован в буфер")
+                self._animate_button_copy(self.copy_pack_preview_btn)
             else:
-                messagebox.showerror("Буфер недоступен", "Не удалось скопировать токен.")
+                messagebox.showerror(
+                    "Буфер недоступен", "Не удалось скопировать токен."
+                )
 
         def _save_pack_preview_as(self):
             text = self.pack_preview.get("1.0", "end").strip()
             if not text:
-                messagebox.showwarning("Нет токена", "Сначала упакуйте файл, папку или текст.")
+                messagebox.showwarning(
+                    "Нет токена", "Сначала упакуйте файл, папку или текст."
+                )
                 return
             path = filedialog.asksaveasfilename(
                 title="Сохранить токен",
                 defaultextension=".txt",
-                filetypes=[("FT token", "*.ft.txt"), ("Text files", "*.txt"), ("All files", "*.*")]
+                filetypes=[
+                    ("FT token", "*.ft.txt"),
+                    ("Text files", "*.txt"),
+                    ("All files", "*.*"),
+                ],
             )
             if path:
                 save_text_file(Path(path), text)
@@ -1321,15 +1737,21 @@ def launch_gui():
             except tk.TclError:
                 text = try_get_clipboard() or ""
             if not text.strip():
-                messagebox.showwarning("Буфер пуст", "В буфере обмена нет текста для упаковки.")
+                messagebox.showwarning(
+                    "Буфер пуст", "В буфере обмена нет текста для упаковки."
+                )
                 return
             self.pack_source_var.set("")
             self.pack_text.delete("1.0", "end")
             self.pack_text.insert("1.0", text)
             if not self.pack_output_var.get().strip():
                 text_file_name = self._get_pack_text_filename()
-                self.pack_output_var.set(str((Path.cwd() / "{}.ft.txt".format(text_file_name)).resolve()))
+                self.pack_output_var.set(
+                    str((Path.cwd() / "{}.ft.txt".format(text_file_name)).resolve())
+                )
             self._set_status("Текст для упаковки вставлен из буфера")
+            # Триггерим авто-режим после вставки
+            self._on_pack_text_changed()
 
         def _clear_pack_text(self):
             self.pack_text.delete("1.0", "end")
@@ -1341,12 +1763,17 @@ def launch_gui():
             except tk.TclError:
                 text = try_get_clipboard() or ""
             if not text.strip():
-                messagebox.showwarning("Буфер пуст", "В буфере обмена нет текста токена.")
+                messagebox.showwarning(
+                    "Буфер пуст", "В буфере обмена нет текста токена."
+                )
                 return
+            self.unpack_input_var.set("")
             self.unpack_text.delete("1.0", "end")
             self.unpack_text.insert("1.0", text)
             self._clear_unpack_result_preview()
             self._set_status("Текст вставлен из буфера")
+            # Триггерим авто-режим после вставки
+            self._on_unpack_text_changed()
 
         def _clear_pack(self):
             self.pack_source_var.set("")
@@ -1393,7 +1820,9 @@ def print_usage():
     print("Использование:")
     print("  python ft.py                         # запустить GUI")
     print("  python ft.py gui                     # запустить GUI")
-    print("  python ft.py web [порт]              # запустить HTML сервер (zero dependencies)")
+    print(
+        "  python ft.py web [порт]              # запустить HTML сервер (zero dependencies)"
+    )
     print("  python ft.py pack <файл_или_папка> [выходной_txt]")
     print("  python ft.py unpack [входной_txt] [папка_назначения]")
     print("")
