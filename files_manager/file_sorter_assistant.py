@@ -42,6 +42,9 @@ STRONG_LEAD_CONFIDENCE_GAP = 0.45
 STRONG_LEAD_AUTO_SELECT_SECONDS = 3
 DUPLICATE_SIMILARITY_THRESHOLD = 0.88
 DUPLICATE_REVIEW_FOLDER = "_duplicates_review"
+LLM_DUPLICATE_MAX_FILES = 300
+LLM_DUPLICATE_MAX_GROUPS = 30
+LLM_DUPLICATE_MAX_HINT_GROUPS = 40
 
 DEFAULT_AUTO_SELECT_SECONDS = 60
 
@@ -817,6 +820,21 @@ VERSION_EXTRACT_RE = re.compile(
     r"(?i)(?:^|[^a-z0-9])(?:v|ver(?:sion)?[._ -]*)?(\d+(?:[._-]\d+){0,5}[a-z]?)(?=$|[^a-z0-9])"
 )
 
+COMPACT_VERSION_RE = re.compile(r"(?i)(?<=[a-z])(\d{3})(?:[a-z]*)$")
+COMPACT_DROP_WORDS = (
+    "enterprise",
+    "professional",
+    "portable",
+    "repack",
+    "crack",
+    "release",
+    "latest",
+    "win",
+    "windows",
+    "x64",
+    "x86",
+)
+
 
 def remove_known_suffix(filename: str) -> str:
     lower_name = filename.lower()
@@ -868,12 +886,81 @@ def duplicate_similarity(left: str, right: str) -> float:
     return max(ratio, jaccard)
 
 
+def compact_duplicate_name(file_path: Path) -> str:
+    name = remove_known_suffix(file_path.name).lower()
+    name = VERSION_EXTRACT_RE.sub(" ", name)
+    for pattern in VERSION_PATTERNS:
+        name = re.sub(pattern, " ", name, flags=re.IGNORECASE)
+
+    compact = re.sub(r"[^a-z0-9]+", "", name)
+    compact = COMPACT_VERSION_RE.sub("", compact)
+
+    for token in COMPACT_DROP_WORDS:
+        compact = compact.replace(token, "")
+
+    return compact
+
+
+def compact_duplicate_skeleton(compact: str) -> str:
+    return re.sub(r"[aeiouy]+", "", compact)
+
+
+def duplicate_files_look_related(left: Path, right: Path) -> bool:
+    left_key = normalize_duplicate_key(left)
+    right_key = normalize_duplicate_key(right)
+
+    if duplicate_similarity(left_key, right_key) >= DUPLICATE_SIMILARITY_THRESHOLD:
+        return True
+
+    left_compact = compact_duplicate_name(left)
+    right_compact = compact_duplicate_name(right)
+
+    if not left_compact or not right_compact:
+        return False
+
+    if left_compact in right_compact or right_compact in left_compact:
+        return True
+
+    if SequenceMatcher(None, left_compact, right_compact).ratio() >= 0.88:
+        return True
+
+    left_skeleton = compact_duplicate_skeleton(left_compact)
+    right_skeleton = compact_duplicate_skeleton(right_compact)
+
+    if len(left_skeleton) < 4 or len(right_skeleton) < 4:
+        return False
+
+    if left_skeleton in right_skeleton or right_skeleton in left_skeleton:
+        return True
+
+    return SequenceMatcher(None, left_skeleton, right_skeleton).ratio() >= 0.86
+
+
+def compact_version_tuple(name: str) -> tuple[int, ...] | None:
+    compact = re.sub(r"[^a-z0-9]+", "", name.lower())
+    match = COMPACT_VERSION_RE.search(compact)
+
+    if not match:
+        return None
+
+    return tuple(int(digit) for digit in match.group(1))
+
+
+def normalize_version_tuple(version: tuple[int, ...] | None) -> tuple[int, ...]:
+    if not version:
+        return ()
+
+    normalized = tuple(version)
+
+    while normalized and normalized[-1] == 0:
+        normalized = normalized[:-1]
+
+    return normalized
+
+
 def duplicate_version_tuple(file_path: Path) -> tuple[int, ...] | None:
     name = remove_known_suffix(file_path.name).lower()
     matches = list(VERSION_EXTRACT_RE.finditer(name))
-
-    if not matches:
-        return None
 
     best: tuple[int, ...] | None = None
 
@@ -889,23 +976,28 @@ def duplicate_version_tuple(file_path: Path) -> tuple[int, ...] | None:
         if best is None or version > best:
             best = version
 
-    return best
+    if best is not None:
+        return best
+
+    return compact_version_tuple(name)
 
 
-def duplicate_file_score(file_path: Path) -> tuple[tuple[int, ...], float, int]:
-    version = duplicate_version_tuple(file_path) or ()
-
+def duplicate_modified_day(file_path: Path) -> str:
     try:
-        mtime = file_path.stat().st_mtime
+        return time.strftime("%Y-%m-%d", time.localtime(file_path.stat().st_mtime))
     except OSError:
-        mtime = 0.0
+        return "0000-00-00"
+
+
+def duplicate_file_score(file_path: Path) -> tuple[tuple[int, ...], str, int]:
+    version = normalize_version_tuple(duplicate_version_tuple(file_path))
 
     try:
         size = file_path.stat().st_size
     except OSError:
         size = 0
 
-    return version, mtime, size
+    return version, duplicate_modified_day(file_path), size
 
 
 def format_version_tuple(version: tuple[int, ...] | None) -> str:
@@ -913,6 +1005,22 @@ def format_version_tuple(version: tuple[int, ...] | None) -> str:
         return "-"
 
     return ".".join(str(part) for part in version)
+
+
+def format_duplicate_version(file_path: Path) -> str:
+    raw_version = duplicate_version_tuple(file_path)
+    comparable_version = normalize_version_tuple(raw_version)
+
+    if not raw_version:
+        return "-"
+
+    raw_text = format_version_tuple(raw_version)
+    comparable_text = format_version_tuple(comparable_version)
+
+    if raw_text == comparable_text:
+        return raw_text
+
+    return f"{raw_text} (= {comparable_text})"
 
 
 def suggest_duplicate_keep(group: list[Path]) -> tuple[int, list[int], str]:
@@ -928,12 +1036,12 @@ def suggest_duplicate_keep(group: list[Path]) -> tuple[int, list[int], str]:
             f"{keep_path.name}"
         )
     else:
-        mtimes = [score[1] for _, _, score in scored]
+        days = [score[1] for _, _, score in scored]
 
-        if len(set(mtimes)) > 1:
+        if len(set(days)) > 1:
             reason = f"версии одинаковы/не найдены, оставить более свежий файл: {keep_path.name}"
         else:
-            reason = f"даты одинаковы, оставить файл большего размера: {keep_path.name}"
+            reason = f"дата модификации в один день, оставить файл большего размера: {keep_path.name}"
 
     return keep_index, delete_indexes, reason
 
@@ -965,6 +1073,9 @@ def find_duplicate_groups(files: list[Path]) -> list[list[Path]]:
                         duplicate_similarity(candidate_key, group_key)
                         >= DUPLICATE_SIMILARITY_THRESHOLD
                         for group_key in group_keys
+                    ) or any(
+                        duplicate_files_look_related(candidate_path, group_path)
+                        for _, group_path in group
                     ):
                         group.append((candidate_key, candidate_path))
                         changed = True
@@ -1013,7 +1124,7 @@ def print_duplicate_group(group: list[Path], index: int, total: int) -> None:
         print(
             f"  [{i:>2}] {file_path.name}\n"
             f"       size: {size} | modified: {format_mtime(file_path)} | "
-            f"version: {format_version_tuple(duplicate_version_tuple(file_path))} | "
+            f"version: {format_duplicate_version(file_path)} | "
             f"key: {normalize_duplicate_key(file_path)}"
         )
 
@@ -1089,6 +1200,872 @@ def delete_duplicate_files(files: list[Path]) -> int:
             print(f"  [ОШИБКА] {file_path.name}: {e}")
 
     return deleted
+
+
+def parse_json_object_response(raw: str) -> dict | None:
+    if not raw:
+        return None
+
+    text = raw.strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"```json\s*", "", text, flags=re.IGNORECASE)
+    text = text.replace("```", "")
+    text = re.sub(r",\s*([\]}])", r"\1", text)
+    text = repair_json_like_text(text)
+
+    decoder = json.JSONDecoder()
+    idx = 0
+
+    while idx < len(text):
+        brace_idx = text.find("{", idx)
+
+        if brace_idx == -1:
+            break
+
+        try:
+            obj, end = decoder.raw_decode(text[brace_idx:])
+        except json.JSONDecodeError:
+            idx = brace_idx + 1
+            continue
+
+        if isinstance(obj, dict):
+            return obj
+
+        idx = brace_idx + max(end, 1)
+
+    return None
+
+
+def duplicate_file_record(file_id: int, file_path: Path) -> dict:
+    try:
+        size_bytes = file_path.stat().st_size
+    except OSError:
+        size_bytes = 0
+
+    version = duplicate_version_tuple(file_path)
+    comparable_version = normalize_version_tuple(version)
+
+    return {
+        "id": file_id,
+        "name": file_path.name,
+        "size": format_size(size_bytes),
+        "size_bytes": size_bytes,
+        "modified": format_mtime(file_path),
+        "extension_group": duplicate_extension_key(file_path),
+        "normalized_key": normalize_duplicate_key(file_path),
+        "detected_version": format_version_tuple(version),
+        "comparable_version": format_version_tuple(comparable_version),
+    }
+
+
+def build_llm_duplicate_prompt(files: list[Path]) -> tuple[str, dict[int, Path]]:
+    id_to_path = {i: file_path for i, file_path in enumerate(files, 1)}
+    records = [duplicate_file_record(i, file_path) for i, file_path in id_to_path.items()]
+    lines = []
+
+    for record in records:
+        lines.append(
+            (
+                f"[{record['id']}] {record['name']} | size={record['size']} "
+                f"({record['size_bytes']}) | modified={record['modified']} | "
+                f"ext_group={record['extension_group']} | detected_version={record['detected_version']} | "
+                f"comparable_version={record['comparable_version']} | "
+                f"key={record['normalized_key']}"
+            )
+        )
+
+    prompt = "\n".join(lines)
+    return prompt, id_to_path
+
+
+def duplicate_hint_tokens(file_path: Path) -> list[str]:
+    spaced_name = re.sub(r"(?<=[a-zа-яё])(?=[A-ZА-ЯЁ])", " ", remove_known_suffix(file_path.name))
+    key = normalize_duplicate_key(Path(spaced_name))
+    compact = compact_duplicate_name(file_path)
+    tokens = [
+        token
+        for token in re.findall(r"[a-zа-яё0-9]+", key.lower())
+        if len(token) >= 4
+    ]
+
+    stop_words = {
+        "setup",
+        "installer",
+        "install",
+        "latest",
+        "release",
+        "repack",
+        "portable",
+        "professional",
+        "enterprise",
+        "windows",
+        "win64",
+        "win32",
+        "crack",
+        "only",
+        "part",
+    }
+    tokens = [token for token in tokens if token not in stop_words]
+
+    if compact and len(compact) >= 5:
+        tokens.append(compact)
+
+    skeleton = compact_duplicate_skeleton(compact)
+
+    if len(skeleton) >= 5:
+        tokens.append(skeleton)
+
+    return list(dict.fromkeys(tokens))
+
+
+def multipart_archive_part(file_path: Path) -> tuple[str, str] | None:
+    name = file_path.name.lower()
+    patterns = (
+        r"(.+?)(?:[._ -])part[\s._-]*(\d+)(?:\.rar|\.zip|\.7z)$",
+        r"(.+?\.7z)\.(\d{3})$",
+        r"(.+?)(?:\.zip|\.rar|\.7z)\.(\d{3})$",
+        r"(.+?)\.r(\d{2,3})$",
+        r"(.+?)\.z(\d{2,3})$",
+        r"(.+?)(?:[._ -])(\d{3})$",
+    )
+    match = None
+
+    for pattern in patterns:
+        match = re.search(pattern, name, flags=re.IGNORECASE)
+
+        if match:
+            break
+
+    if not match:
+        return None
+
+    base = re.sub(r"[\W_]+", " ", match.group(1)).strip()
+    number = str(int(match.group(2)))
+    return base, number
+
+
+def all_same_multipart_set(ids: list[int], id_to_path: dict[int, Path]) -> bool:
+    parts = [multipart_archive_part(id_to_path[file_id]) for file_id in ids]
+
+    if not parts or any(part is None for part in parts):
+        return False
+
+    bases = {part[0] for part in parts if part is not None}
+    numbers = {part[1] for part in parts if part is not None}
+
+    return len(bases) == 1 and len(numbers) == len(ids)
+
+
+def group_contains_multipart_set_parts(ids: list[int], id_to_path: dict[int, Path]) -> bool:
+    by_base: dict[str, set[str]] = {}
+
+    for file_id in ids:
+        if file_id not in id_to_path:
+            continue
+
+        part = multipart_archive_part(id_to_path[file_id])
+
+        if not part:
+            continue
+
+        base, number = part
+        by_base.setdefault(base, set()).add(number)
+
+    return any(len(numbers) > 1 for numbers in by_base.values())
+
+
+def build_llm_duplicate_hints(id_to_path: dict[int, Path]) -> str:
+    hint_groups: list[tuple[str, list[int], str]] = []
+    seen_signatures: set[tuple[int, ...]] = set()
+
+    def add_hint(label: str, ids: list[int], source: str) -> None:
+        clean_ids = sorted(dict.fromkeys(file_id for file_id in ids if file_id in id_to_path))
+
+        if len(clean_ids) < 2:
+            return
+
+        if all_same_multipart_set(clean_ids, id_to_path) or group_contains_multipart_set_parts(clean_ids, id_to_path):
+            return
+
+        signature = tuple(clean_ids)
+
+        if signature in seen_signatures:
+            return
+
+        seen_signatures.add(signature)
+        hint_groups.append((label, clean_ids, source))
+
+    path_to_id = {file_path: file_id for file_id, file_path in id_to_path.items()}
+
+    for group in find_duplicate_groups(list(id_to_path.values())):
+        add_hint(
+            normalize_duplicate_key(group[0]) or "local-similarity",
+            [path_to_id[path] for path in group if path in path_to_id],
+            "local_similarity",
+        )
+
+    token_buckets: dict[str, list[int]] = {}
+
+    for file_id, file_path in id_to_path.items():
+        for token in duplicate_hint_tokens(file_path):
+            token_buckets.setdefault(token, []).append(file_id)
+
+    for token, ids in sorted(token_buckets.items(), key=lambda item: (-len(item[1]), item[0])):
+        if len(ids) < 2:
+            continue
+
+        add_hint(token, ids, "shared_name_token")
+
+    for left_id, left_path in id_to_path.items():
+        related_ids = [left_id]
+
+        for right_id, right_path in id_to_path.items():
+            if right_id <= left_id:
+                continue
+
+            if duplicate_files_look_related(left_path, right_path):
+                related_ids.append(right_id)
+
+        if len(related_ids) > 1:
+            add_hint(compact_duplicate_name(left_path) or normalize_duplicate_key(left_path), related_ids, "fallback_similarity")
+
+    lines: list[str] = []
+
+    for index, (label, ids, source) in enumerate(hint_groups[:LLM_DUPLICATE_MAX_HINT_GROUPS], 1):
+        members = ", ".join(f"[{file_id}] {id_to_path[file_id].name}" for file_id in ids)
+        lines.append(f"{index}. {label} | source={source} | ids={ids} | files={members}")
+
+    return "\n".join(lines) if lines else "none"
+
+
+def parse_llm_rejected_duplicate_hints(data: dict) -> list[dict]:
+    rejected: list[dict] = []
+
+    for raw_item in data.get("rejected_hints", []):
+        if not isinstance(raw_item, dict):
+            continue
+
+        ids: list[int] = []
+
+        for value in raw_item.get("ids", []):
+            try:
+                file_id = int(value)
+            except Exception:
+                continue
+
+            if file_id not in ids:
+                ids.append(file_id)
+
+        reason = str(raw_item.get("reason", "")).strip()
+
+        if ids and reason:
+            rejected.append({"ids": ids, "reason": reason})
+
+    return rejected
+
+
+def ask_llm_duplicate_groups(files: list[Path]) -> tuple[list[dict], dict[int, Path], list[dict]]:
+    prompt, id_to_path = build_llm_duplicate_prompt(files)
+    hints = build_llm_duplicate_hints(id_to_path)
+    hint_count = 0 if hints == "none" else hints.count("\n") + 1
+    print(f"  [dup-llm] Широких кандидатов для LLM: {hint_count}")
+
+    system_prompt = f"""\
+You are a cautious duplicate-file review assistant.
+You receive files from one folder. Find possible duplicate files, older versions, renamed variants, or product-family version conflicts.
+
+Return ONLY one JSON object:
+{{
+  "groups": [
+    {{
+      "title": "short group name",
+      "confidence": 0.0,
+      "keep": 1,
+      "delete": [2, 3],
+      "reason": "short Russian reason"
+    }}
+  ],
+  "rejected_hints": [
+    {{
+      "ids": [1, 2],
+      "reason": "short Russian reason why this broad hint is not a duplicate/version group"
+    }}
+  ]
+}}
+
+Rules:
+1. Return review candidates, not automatic deletions. It is acceptable to include medium-confidence candidates for manual review.
+2. Extract and compare versions yourself from the filename. Do not rely only on detected_version; it is a weak hint.
+3. Version patterns can be diverse: v1.2.6, 1.2.6, 126 meaning 1.2.6 for compact product names, 2025.3.3, 20.0.5.17637, R25, beta/build/release suffixes.
+4. Treat trailing zero version parts as equal: 2.2.6.0 equals 2.2.6. Use comparable_version for that comparison.
+5. Use filename, size, modified date, extension group, normalized key, detected_version, comparable_version, spelling variants, and abbreviations.
+6. Include all visible versions of the same product family in one group; do not ignore a newer version candidate.
+7. Priority for keep/delete: newest comparable_version first; if versions are equal or absent, newer modified date; if modified date is the same day, larger size.
+8. Never keep an older version only because its archive contents look larger, fuller, or more reliable. If the newer file is a different product, omit the group instead.
+9. A typo, abbreviation, or compact spelling in the filename does not make a newer version worse by itself.
+10. Compare file size only by the numeric size_bytes field. Do not claim a file is smaller/larger unless size_bytes proves it.
+11. Multipart archives like part1/part2 are usually a set, not duplicates. Do not mark one part for deletion unless the same part is duplicated.
+12. A plugin/addon/preset for an application is not a duplicate of the host application itself.
+13. Broad candidate hints are only hints. You may split a hint into smaller groups.
+14. Hints with source=local_similarity are strong review candidates. Return them as groups unless they are clearly different products.
+15. For every broad candidate hint: either return a group, or add a rejected_hints item with a concrete reason.
+16. If files look like the same product line but you are not fully sure, return a lower-confidence group instead of rejecting it.
+17. Never suggest deleting all files in a group.
+18. Return at most {LLM_DUPLICATE_MAX_GROUPS} groups.
+19. "delete" contains file IDs that are candidates for manual deletion. No action will be automatic.
+20. In reason, mention the version/name comparison you used.
+"""
+
+    raw = call_llm_raw(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Files:\n{prompt}\n\nBroad candidate hints:\n{hints}"},
+        ]
+    )
+
+    if not raw:
+        return [], id_to_path, []
+
+    data = parse_json_object_response(raw)
+
+    if not data:
+        print("  [ОШИБКА] LLM не вернула JSON с groups.")
+        print(f"  [DEBUG RAW]:\n{raw[:1000]}...\n")
+        return [], id_to_path, []
+
+    if not isinstance(data.get("groups"), list):
+        data["groups"] = []
+
+    groups: list[dict] = []
+    used_delete_ids: set[int] = set()
+    rejected_hints = parse_llm_rejected_duplicate_hints(data)
+
+    for raw_group in data["groups"]:
+        if not isinstance(raw_group, dict):
+            continue
+
+        try:
+            keep_id = int(raw_group.get("keep"))
+        except Exception:
+            continue
+
+        if keep_id not in id_to_path:
+            continue
+
+        delete_ids: list[int] = []
+
+        for value in raw_group.get("delete", []):
+            try:
+                file_id = int(value)
+            except Exception:
+                continue
+
+            if file_id == keep_id or file_id not in id_to_path or file_id in used_delete_ids:
+                continue
+
+            if file_id not in delete_ids:
+                delete_ids.append(file_id)
+
+        if not delete_ids:
+            continue
+
+        if group_contains_multipart_set_parts([keep_id, *delete_ids], id_to_path):
+            continue
+
+        used_delete_ids.update(delete_ids)
+
+        try:
+            confidence = max(0.0, min(1.0, float(raw_group.get("confidence", 0.0))))
+        except Exception:
+            confidence = 0.0
+
+        groups.append(
+            {
+                "title": str(raw_group.get("title", "")).strip() or normalize_duplicate_key(id_to_path[keep_id]),
+                "confidence": confidence,
+                "keep": keep_id,
+                "delete": delete_ids,
+                "reason": str(raw_group.get("reason", "")).replace('"', "'").strip(),
+            }
+        )
+
+        if len(groups) >= LLM_DUPLICATE_MAX_GROUPS:
+            break
+
+    return groups, id_to_path, rejected_hints
+
+
+def format_duplicate_archive_detail(file_id: int, file_path: Path) -> str:
+    if not archive_suffix(file_path):
+        return f"[{file_id}] {file_path.name}\narchive: no\n"
+
+    info = inspect_archive(file_path)
+
+    if not info.supported:
+        return (
+            f"[{file_id}] {file_path.name}\n"
+            f"archive: yes\n"
+            f"scan_error: {info.error}\n"
+        )
+
+    entries = "\n".join(f"  - {entry}" for entry in info.preview_entries)
+    extension_counts: dict[str, int] = {}
+
+    for entry in info.preview_entries:
+        suffix = Path(entry).suffix.lower() or "<no_ext>"
+        extension_counts[suffix] = extension_counts.get(suffix, 0) + 1
+
+    ext_summary = ", ".join(
+        f"{suffix}:{count}"
+        for suffix, count in sorted(extension_counts.items(), key=lambda item: (-item[1], item[0]))
+    )
+    classification = info.classification or "unknown"
+    reason = info.reason or "no strong deterministic signal"
+
+    return (
+        f"[{file_id}] {file_path.name}\n"
+        f"archive: yes\n"
+        f"type: {info.archive_type}\n"
+        f"entries_scanned: {info.entries_scanned}\n"
+        f"classification: {classification}\n"
+        f"classification_reason: {reason}\n"
+        f"sample_extension_counts: {ext_summary or 'none'}\n"
+        f"sample_entries:\n{entries}\n"
+    )
+
+
+def validate_llm_duplicate_groups(data: dict, id_to_path: dict[int, Path]) -> list[dict]:
+    if not isinstance(data.get("groups"), list):
+        return []
+
+    groups: list[dict] = []
+    used_delete_ids: set[int] = set()
+
+    for raw_group in data["groups"]:
+        if not isinstance(raw_group, dict):
+            continue
+
+        try:
+            keep_id = int(raw_group.get("keep"))
+        except Exception:
+            continue
+
+        if keep_id not in id_to_path:
+            continue
+
+        delete_ids: list[int] = []
+
+        for value in raw_group.get("delete", []):
+            try:
+                file_id = int(value)
+            except Exception:
+                continue
+
+            if file_id == keep_id or file_id not in id_to_path or file_id in used_delete_ids:
+                continue
+
+            if file_id not in delete_ids:
+                delete_ids.append(file_id)
+
+        if not delete_ids:
+            continue
+
+        if group_contains_multipart_set_parts([keep_id, *delete_ids], id_to_path):
+            continue
+
+        used_delete_ids.update(delete_ids)
+
+        try:
+            confidence = max(0.0, min(1.0, float(raw_group.get("confidence", 0.0))))
+        except Exception:
+            confidence = 0.0
+
+        groups.append(
+            {
+                "title": str(raw_group.get("title", "")).strip() or normalize_duplicate_key(id_to_path[keep_id]),
+                "confidence": confidence,
+                "keep": keep_id,
+                "delete": delete_ids,
+                "reason": str(raw_group.get("reason", "")).replace('"', "'").strip(),
+            }
+        )
+
+        if len(groups) >= LLM_DUPLICATE_MAX_GROUPS:
+            break
+
+    return groups
+
+
+def expand_llm_duplicate_groups(groups: list[dict], id_to_path: dict[int, Path]) -> list[dict]:
+    expanded: list[dict] = []
+    consumed_delete_ids: set[int] = set()
+
+    for group in groups:
+        group_ids = [group["keep"], *group["delete"]]
+        related_ids = set(group_ids)
+
+        for file_id, file_path in id_to_path.items():
+            if file_id in related_ids:
+                continue
+
+            if any(duplicate_files_look_related(file_path, id_to_path[group_id]) for group_id in group_ids):
+                related_ids.add(file_id)
+
+        if len(related_ids) < 2:
+            continue
+
+        if group_contains_multipart_set_parts(sorted(related_ids), id_to_path):
+            continue
+
+        candidates = sorted(related_ids)
+        keep_id = max(candidates, key=lambda file_id: duplicate_file_score(id_to_path[file_id]))
+        delete_ids = [
+            file_id
+            for file_id in candidates
+            if file_id != keep_id and file_id not in consumed_delete_ids
+        ]
+
+        if not delete_ids:
+            continue
+
+        consumed_delete_ids.update(delete_ids)
+        added_ids = sorted(set(candidates) - set(group_ids))
+        added_text = f"; добавлены похожие ID {added_ids}" if added_ids else ""
+
+        expanded.append(
+            {
+                **group,
+                "llm_keep": group["keep"],
+                "llm_delete": group["delete"],
+                "keep": keep_id,
+                "delete": delete_ids,
+                "fallback_added_ids": added_ids,
+                "reason": f"{group['reason']}{added_text}",
+            }
+        )
+
+    return expanded
+
+
+def group_file_ids(group: dict) -> set[int]:
+    return {int(file_id) for file_id in [group["keep"], *group["delete"]]}
+
+
+def enforce_llm_duplicate_priority(
+    refined_groups: list[dict],
+    source_groups: list[dict],
+    id_to_path: dict[int, Path],
+) -> list[dict]:
+    fixed: list[dict] = []
+    used_delete_ids: set[int] = set()
+
+    for group in refined_groups:
+        candidate_ids = group_file_ids(group)
+
+        for source_group in source_groups:
+            source_ids = group_file_ids(source_group)
+
+            if candidate_ids & source_ids:
+                candidate_ids |= source_ids
+
+        candidate_ids = {
+            file_id
+            for file_id in candidate_ids
+            if file_id in id_to_path and id_to_path[file_id].exists()
+        }
+
+        if len(candidate_ids) < 2:
+            continue
+
+        if group_contains_multipart_set_parts(sorted(candidate_ids), id_to_path):
+            continue
+
+        keep_id = max(candidate_ids, key=lambda file_id: duplicate_file_score(id_to_path[file_id]))
+        delete_ids = [
+            file_id
+            for file_id in sorted(candidate_ids)
+            if file_id != keep_id and file_id not in used_delete_ids
+        ]
+
+        if not delete_ids:
+            continue
+
+        used_delete_ids.update(delete_ids)
+        old_keep = group["keep"]
+        reason = group["reason"]
+
+        if keep_id != old_keep:
+            reason = (
+                f"{reason}; исправлено правилом приоритета: оставить "
+                f"{id_to_path[keep_id].name}, потому что у него выше версия/дата/размер по правилу выбора"
+            )
+
+        fixed.append(
+            {
+                **group,
+                "keep": keep_id,
+                "delete": delete_ids,
+                "reason": reason,
+            }
+        )
+
+    return fixed
+
+
+def format_duplicate_rule_report(groups: list[dict], id_to_path: dict[int, Path]) -> str:
+    reports: list[str] = []
+
+    for index, group in enumerate(groups, 1):
+        candidate_ids = sorted(group_file_ids(group))
+        scored = [
+            (file_id, id_to_path[file_id], duplicate_file_score(id_to_path[file_id]))
+            for file_id in candidate_ids
+            if file_id in id_to_path and id_to_path[file_id].exists()
+        ]
+
+        if len(scored) < 2:
+            continue
+
+        keep_id, keep_path, keep_score = max(scored, key=lambda item: item[2])
+        versions = [score[0] for _, _, score in scored if score[0]]
+        days = [score[1] for _, _, score in scored]
+
+        if versions and len(set(versions)) > 1:
+            criterion = "newest comparable_version"
+        elif len(set(days)) > 1:
+            criterion = "same/absent comparable_version, newest modified date"
+        else:
+            criterion = "same comparable_version and same modified day, largest size"
+
+        delete_ids = [file_id for file_id, _, _ in scored if file_id != keep_id]
+        rows = [
+            (
+                f"  [{file_id}] {path.name} | comparable_version={format_version_tuple(score[0])} | "
+                f"modified_day={score[1]} | size_bytes={score[2]}"
+            )
+            for file_id, path, score in scored
+        ]
+        reports.append(
+            "\n".join(
+                [
+                    f"Group {index}:",
+                    f"strict_keep={keep_id} ({keep_path.name})",
+                    f"strict_delete={delete_ids}",
+                    f"strict_criterion={criterion}",
+                    "candidates:",
+                    *rows,
+                ]
+            )
+        )
+
+    return "\n\n".join(reports)
+
+
+def refine_llm_duplicate_groups_with_archives(
+    groups: list[dict],
+    id_to_path: dict[int, Path],
+) -> list[dict]:
+    involved_ids: list[int] = []
+
+    for group in groups:
+        for file_id in [group["keep"], *group["delete"]]:
+            if file_id not in involved_ids:
+                involved_ids.append(file_id)
+
+    archive_ids = [
+        file_id
+        for file_id in involved_ids
+        if archive_suffix(id_to_path[file_id])
+    ]
+    has_fallback_added = any(group.get("fallback_added_ids") for group in groups)
+
+    if not archive_ids and not has_fallback_added:
+        return groups
+
+    if archive_ids:
+        print(f"  [LLM] Быстро читаю содержимое архивов кандидатов: {len(archive_ids)}")
+
+    if has_fallback_added:
+        print("  [LLM] Проверяю fallback-кандидатов по полному контексту группы...")
+
+    original_groups = json.dumps(
+        {
+            "groups": groups,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    archive_details = "\n".join(
+        format_duplicate_archive_detail(file_id, id_to_path[file_id])
+        for file_id in archive_ids
+    )
+    candidate_details = "\n".join(
+        (
+            f"[{record['id']}] {record['name']} | size={record['size']} "
+            f"({record['size_bytes']}) | modified={record['modified']} | "
+            f"ext_group={record['extension_group']} | detected_version={record['detected_version']} | "
+            f"comparable_version={record['comparable_version']} | "
+            f"key={record['normalized_key']}"
+        )
+        for record in (
+            duplicate_file_record(file_id, id_to_path[file_id])
+            for file_id in involved_ids
+        )
+    )
+    rule_report = format_duplicate_rule_report(groups, id_to_path)
+
+    system_prompt = f"""\
+You are a cautious duplicate-file review assistant.
+You already proposed duplicate groups. Now review them using candidate file details and quick archive contents when available.
+
+Return ONLY one JSON object:
+{{
+  "groups": [
+    {{
+      "title": "short group name",
+      "confidence": 0.0,
+      "keep": 1,
+      "delete": [2, 3],
+      "reason": "short Russian reason"
+    }}
+  ]
+}}
+
+Rules:
+1. Keep a group only if files are likely the same product/asset/tool or older/newer versions.
+2. If archive contents clearly differ in product type, ecosystem, or main files, omit that group.
+3. Use archive sample entries to compare internal structure and main file types.
+4. fallback_added_ids are only weak local candidates; confirm or reject them yourself.
+5. Extract and compare versions yourself from filenames. Version patterns can be diverse: v1.2.6, 126 meaning 1.2.6 for compact product names, 2025.3.3, 20.0.5.17637, R25, beta/build/release suffixes.
+6. Treat trailing zero version parts as equal: 2.2.6.0 equals 2.2.6. Use comparable_version for that comparison.
+7. Include all visible versions of the same product family in one group; do not ignore a newer version candidate.
+8. Priority for keep/delete: newest comparable_version first; if versions are equal or absent, newer modified date; if modified date is the same day, larger size.
+9. Never keep an older version only because its archive contents look larger, fuller, or more reliable. If the newer file is a different product, omit the group instead.
+10. A typo, abbreviation, or compact spelling in the filename does not make a newer version worse by itself.
+11. Archive quick scans are partial evidence; do not call a file "full" or "only installer" unless the sample entries clearly prove it.
+12. Compare file size only by the numeric size_bytes field. Do not claim a file is smaller/larger unless size_bytes proves it.
+13. Multipart archives like part1/part2 are usually a set, not duplicates. Do not mark one part for deletion unless the same part is duplicated.
+14. A plugin/addon/preset for an application is not a duplicate of the host application itself.
+15. The Strict local rule report is authoritative for version/date/size ordering. Follow strict_keep unless archive contents prove the candidates are different products.
+16. Never suggest deleting all files in a group.
+17. No action will be automatic; user will confirm manually.
+18. Return at most {LLM_DUPLICATE_MAX_GROUPS} groups.
+19. In reason, mention the version comparison you used.
+"""
+
+    raw = call_llm_raw(
+        [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"Original candidate groups:\n{original_groups}\n\n"
+                    f"Candidate file details:\n{candidate_details}\n\n"
+                    f"Strict local rule report:\n{rule_report}\n\n"
+                    f"Archive quick scans:\n{archive_details}"
+                ),
+            },
+        ]
+    )
+
+    if not raw:
+        return groups
+
+    data = parse_json_object_response(raw)
+
+    if not data:
+        print("  [LLM] Не удалось уточнить группы по содержимому архивов. Использую первичный список.")
+        return groups
+
+    refined = validate_llm_duplicate_groups(data, id_to_path)
+
+    if not refined:
+        print("  [LLM] После проверки архивов подходящих дублей не осталось.")
+        return []
+
+    return enforce_llm_duplicate_priority(refined, groups, id_to_path)
+
+
+def print_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], index: int, total: int) -> None:
+    keep_path = id_to_path[group["keep"]]
+
+    print(f"\n{hr('═')}")
+    print(f"  LLM дубли: группа {index}/{total}")
+    print(f"  Название : {group['title']}")
+    print(f"  Уверенность: {group['confidence']:.0%}")
+    print(f"{hr('═')}")
+    print(f"  Оставить: [{group['keep']}] {keep_path.name}")
+    print(
+        f"       size: {format_size(keep_path.stat().st_size)} | "
+        f"modified: {format_mtime(keep_path)} | "
+        f"version: {format_duplicate_version(keep_path)}"
+    )
+    print("  К удалению:")
+
+    for file_id in group["delete"]:
+        file_path = id_to_path[file_id]
+        print(
+            f"    [{file_id}] {file_path.name}\n"
+            f"         size: {format_size(file_path.stat().st_size)} | "
+            f"modified: {format_mtime(file_path)} | "
+            f"version: {format_duplicate_version(file_path)}"
+        )
+
+    print(f"  Причина: {group['reason']}")
+
+
+def print_rejected_duplicate_hints(rejected_hints: list[dict], id_to_path: dict[int, Path]) -> None:
+    if not rejected_hints:
+        return
+
+    print("\n  [dup-llm] Отклоненные широкие кандидаты:")
+
+    for index, item in enumerate(rejected_hints, 1):
+        ids = [file_id for file_id in item["ids"] if file_id in id_to_path]
+
+        if not ids:
+            continue
+
+        names = ", ".join(f"[{file_id}] {id_to_path[file_id].name}" for file_id in ids)
+        print(f"    {index}. {names}")
+        print(f"       └─ {item['reason']}")
+
+
+def apply_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], root: Path) -> tuple[str, int]:
+    delete_files = [id_to_path[file_id] for file_id in group["delete"] if id_to_path[file_id].exists()]
+
+    while True:
+        choice = read_input("\n  duplicates_llm [d=delete, m=move, s=skip, q=quit]> ").strip().lower()
+
+        if choice == "q":
+            return "quit", 0
+
+        if choice == "s":
+            print("  [dup] Группа пропущена.")
+            return "done", 0
+
+        if choice == "m":
+            if ask_yes_no(
+                f"  Переместить {len(delete_files)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
+            ):
+                moved = move_duplicate_files(root, delete_files)
+                return ("done", 1) if moved else ("done", 0)
+
+            continue
+
+        if choice == "d":
+            print("  Будут удалены:")
+
+            for file_path in delete_files:
+                print(f"    - {file_path.name}")
+
+            if ask_yes_no("  Удалить предложенные LLM файлы безвозвратно? [y/n]: "):
+                deleted = delete_duplicate_files(delete_files)
+                return ("done", 1) if deleted else ("done", 0)
+
+            continue
+
+        print("  [!] Введите d, m, s или q.")
 
 
 def apply_duplicate_command(
@@ -2561,6 +3538,81 @@ def cmd_duplicates() -> None:
     print(f"\n  [✓] Проверка дублей завершена. Обработано групп: {processed}")
 
 
+def cmd_duplicates_llm() -> None:
+    if not state.root:
+        print("  [!] Установите источник командой: root")
+        return
+
+    if not state.root.is_dir():
+        print(f"  [!] root недоступен: {state.root}")
+        return
+
+    files = get_files_in_root(state.root)
+
+    if not files:
+        print("  [!] В root нет файлов для проверки.")
+        return
+
+    if len(files) > LLM_DUPLICATE_MAX_FILES:
+        print(
+            f"  [!] Файлов {len(files)}, в LLM будет отправлено только первых "
+            f"{LLM_DUPLICATE_MAX_FILES} по имени."
+        )
+        files = files[:LLM_DUPLICATE_MAX_FILES]
+
+    print(f"  [dup-llm] Отправляю LLM список файлов: {len(files)}")
+    groups, id_to_path, rejected_hints = ask_llm_duplicate_groups(files)
+
+    if not groups:
+        print("  [✓] LLM не нашла уверенных кандидатов на дубли.")
+        print_rejected_duplicate_hints(rejected_hints, id_to_path)
+        return
+
+    groups = expand_llm_duplicate_groups(groups, id_to_path)
+
+    if not groups:
+        print("  [✓] После расширения похожих имён дубли не подтверждены.")
+        print_rejected_duplicate_hints(rejected_hints, id_to_path)
+        return
+
+    groups = refine_llm_duplicate_groups_with_archives(groups, id_to_path)
+
+    if not groups:
+        print("  [✓] После проверки содержимого архивов дубли не подтверждены.")
+        print_rejected_duplicate_hints(rejected_hints, id_to_path)
+        return
+
+    print(f"  [dup-llm] Подтверждено групп: {len(groups)}")
+    print("  Действия для каждой группы:")
+    print("    d — удалить предложенные файлы после подтверждения")
+    print(f"    m — переместить предложенные файлы в {DUPLICATE_REVIEW_FOLDER}/")
+    print("    s — пропустить")
+    print("    q — выйти")
+
+    processed = 0
+
+    for group_index, group in enumerate(groups, 1):
+        live_delete_ids = [
+            file_id
+            for file_id in group["delete"]
+            if id_to_path[file_id].exists()
+        ]
+
+        if not id_to_path[group["keep"]].exists() or not live_delete_ids:
+            continue
+
+        group = {**group, "delete": live_delete_ids}
+        print_llm_duplicate_group(group, id_to_path, group_index, len(groups))
+        status, processed_delta = apply_llm_duplicate_group(group, id_to_path, state.root)
+        processed += processed_delta
+
+        if status == "quit":
+            print(f"  [dup-llm] Обработано групп: {processed}")
+            return
+
+    print(f"\n  [✓] LLM-проверка дублей завершена. Обработано групп: {processed}")
+
+
 def cmd_status() -> None:
     print(f"\n{hr()}")
     print(f"  INI             : {CONFIG_PATH}")
@@ -2596,6 +3648,7 @@ def cmd_help() -> None:
         f"  folders     — вручную пересканировать папки в dest/root\n"
         f"  start       — начать сортировку, папки сканируются автоматически\n"
         f"  duplicates  — найти похожие файлы/версии в root\n"
+        f"  duplicates_llm — LLM-поиск дублей с проверкой содержимого архивов\n"
         f"  timeout N   — изменить таймаут автовыбора, 0 = отключить\n"
         f"  status      — статус\n"
         f"  help        — помощь\n"
@@ -2611,6 +3664,7 @@ COMMANDS = {
     "folders": cmd_folders,
     "start": cmd_start,
     "duplicates": cmd_duplicates,
+    "duplicates_llm": cmd_duplicates_llm,
     "status": cmd_status,
     "help": cmd_help,
 }
