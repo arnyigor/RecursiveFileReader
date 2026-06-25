@@ -18,6 +18,7 @@ import tarfile
 import zipfile
 import queue
 import threading
+import tempfile
 from difflib import SequenceMatcher
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -37,6 +38,11 @@ MAX_DEPTH = 5
 MAX_RECOMMENDATIONS = 5
 MAX_ARCHIVE_SCAN_ENTRIES = 5000
 MAX_ARCHIVE_PREVIEW_ENTRIES = 12
+MAX_DUPLICATE_ARCHIVE_DETAIL_ENTRIES = 120
+MAX_DUPLICATE_ARCHIVE_REPORT_FILES = 24
+MAX_DUPLICATE_ARCHIVE_UNIQUE_PATHS = 18
+MAX_NESTED_ARCHIVE_BYTES = 900 * 1024 * 1024
+MAX_NESTED_ARCHIVES_PER_PARENT = 2
 MIN_RECOMMENDATION_CONFIDENCE = 0.30
 STRONG_LEAD_CONFIDENCE_GAP = 0.45
 STRONG_LEAD_AUTO_SELECT_SECONDS = 3
@@ -101,6 +107,13 @@ class ArchiveInspection:
     classification: str | None = None
     reason: str = ""
     error: str = ""
+
+
+@dataclass
+class ArchiveEntryDetail:
+    path: str
+    size: int | None = None
+    modified: str = ""
 
 
 # ─────────────────────────────────────────────
@@ -390,12 +403,57 @@ def limited_archive_entries(entries: list[str]) -> tuple[list[str], bool]:
     return normalized[:MAX_ARCHIVE_SCAN_ENTRIES], len(normalized) > MAX_ARCHIVE_SCAN_ENTRIES
 
 
+def limited_archive_entry_details(entries: list[ArchiveEntryDetail]) -> tuple[list[ArchiveEntryDetail], bool]:
+    normalized: list[ArchiveEntryDetail] = []
+
+    for entry in entries:
+        path = normalize_archive_entry(entry.path)
+
+        if path:
+            normalized.append(ArchiveEntryDetail(path=path, size=entry.size, modified=entry.modified))
+
+    return normalized[:MAX_ARCHIVE_SCAN_ENTRIES], len(normalized) > MAX_ARCHIVE_SCAN_ENTRIES
+
+
+def format_zip_datetime(date_time: tuple[int, int, int, int, int, int]) -> str:
+    try:
+        return f"{date_time[0]:04d}-{date_time[1]:02d}-{date_time[2]:02d} {date_time[3]:02d}:{date_time[4]:02d}"
+    except Exception:
+        return ""
+
+
+def format_timestamp(ts: float | int | None) -> str:
+    if not ts:
+        return ""
+
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+    except Exception:
+        return ""
+
+
 def read_zip_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
     with zipfile.ZipFile(file_path) as archive:
         names = [info.filename for info in archive.infolist() if not info.is_dir()]
 
     entries, truncated = limited_archive_entries(names)
     return entries, len(names), truncated
+
+
+def read_zip_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
+    with zipfile.ZipFile(file_path) as archive:
+        infos = [
+            ArchiveEntryDetail(
+                path=info.filename,
+                size=info.file_size,
+                modified=format_zip_datetime(info.date_time),
+            )
+            for info in archive.infolist()
+            if not info.is_dir()
+        ]
+
+    entries, truncated = limited_archive_entry_details(infos)
+    return entries, len(infos), truncated
 
 
 def read_tar_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
@@ -409,6 +467,31 @@ def read_tar_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
 
                 if path:
                     entries.append(path)
+
+            if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
+                truncated = True
+                break
+
+    return entries, None, truncated
+
+
+def read_tar_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
+    entries: list[ArchiveEntryDetail] = []
+    truncated = False
+
+    with tarfile.open(file_path, mode="r:*") as archive:
+        for member in archive:
+            if member.isfile():
+                path = normalize_archive_entry(member.name)
+
+                if path:
+                    entries.append(
+                        ArchiveEntryDetail(
+                            path=path,
+                            size=member.size,
+                            modified=format_timestamp(member.mtime),
+                        )
+                    )
 
             if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
                 truncated = True
@@ -451,6 +534,33 @@ def candidate_archive_tools(names: list[str], common_relative_paths: list[str]) 
     return unique
 
 
+def run_archive_tool(args: list[str], timeout: int) -> tuple[subprocess.CompletedProcess[str] | None, str]:
+    startupinfo = None
+    creationflags = 0
+
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    try:
+        completed = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+        return completed, ""
+    except Exception as e:
+        return None, str(e)
+
+
 def parse_7z_slt_output(output: str, archive_name: str) -> tuple[list[str], int | None, bool]:
     entries: list[str] = []
 
@@ -467,6 +577,58 @@ def parse_7z_slt_output(output: str, archive_name: str) -> tuple[list[str], int 
             return entries, None, True
 
     return entries, len(entries), False
+
+
+def parse_7z_slt_details(output: str, archive_name: str) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
+    entries: list[ArchiveEntryDetail] = []
+    current: dict[str, str] = {}
+
+    def flush_current() -> None:
+        if not current:
+            return
+
+        path = normalize_archive_entry(current.get("Path", ""))
+
+        if not path or path == archive_name:
+            current.clear()
+            return
+
+        attributes = current.get("Attributes", "")
+        size_raw = current.get("Size", "")
+
+        if "D" in attributes and not size_raw:
+            current.clear()
+            return
+
+        try:
+            size = int(size_raw) if size_raw else None
+        except ValueError:
+            size = None
+
+        modified = current.get("Modified", "")[:16]
+        entries.append(ArchiveEntryDetail(path=path, size=size, modified=modified))
+        current.clear()
+
+    for line in output.splitlines():
+        if not line.strip():
+            flush_current()
+            continue
+
+        if " = " not in line:
+            continue
+
+        key, value = line.split(" = ", 1)
+
+        if key == "Path" and current:
+            flush_current()
+
+        current[key] = value
+
+        if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
+            return entries, None, True
+
+    flush_current()
+    return entries[:MAX_ARCHIVE_SCAN_ENTRIES], len(entries), len(entries) > MAX_ARCHIVE_SCAN_ENTRIES
 
 
 def read_7z_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
@@ -526,6 +688,68 @@ def read_7z_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
     raise RuntimeError("; ".join(errors))
 
 
+def read_7z_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
+    py7zr_error = ""
+
+    try:
+        import py7zr  # type: ignore
+
+        with py7zr.SevenZipFile(file_path, mode="r") as archive:
+            infos = []
+
+            for info in archive.list():
+                if not getattr(info, "is_file", False):
+                    continue
+
+                size = getattr(info, "uncompressed", None)
+                modified = getattr(info, "lastwritetime", None)
+                modified_text = modified.strftime("%Y-%m-%d %H:%M") if modified else ""
+                infos.append(ArchiveEntryDetail(path=info.filename, size=size, modified=modified_text))
+
+        entries, truncated = limited_archive_entry_details(infos)
+        return entries, len(infos), truncated
+    except ImportError:
+        pass
+    except Exception as e:
+        py7zr_error = f"py7zr: {e}"
+
+    tools = candidate_archive_tools(
+        names=["7z", "7za", "7z.exe", "7za.exe"],
+        common_relative_paths=[
+            "7-Zip/7z.exe",
+            "7-Zip/7za.exe",
+            "NanaZip/NanaZipC.exe",
+        ],
+    )
+
+    if not tools:
+        suffix = f"; {py7zr_error}" if py7zr_error else ""
+        raise RuntimeError(
+            "для .7z не найден py7zr или 7z/7za в PATH/Program Files"
+            f"{suffix}"
+        )
+
+    errors: list[str] = [py7zr_error] if py7zr_error else []
+
+    for exe in tools:
+        completed = subprocess.run(
+            [exe, "l", "-slt", str(file_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+
+        if completed.returncode == 0:
+            return parse_7z_slt_details(completed.stdout, file_path.name)
+
+        errors.append(completed.stderr.strip() or completed.stdout.strip() or exe)
+
+    raise RuntimeError("; ".join(errors))
+
+
 def read_rar_entries_with_rarfile(file_path: Path) -> tuple[list[str], int | None, bool] | None:
     try:
         import rarfile  # type: ignore
@@ -537,6 +761,27 @@ def read_rar_entries_with_rarfile(file_path: Path) -> tuple[list[str], int | Non
 
     entries, truncated = limited_archive_entries(names)
     return entries, len(names), truncated
+
+
+def read_rar_entry_details_with_rarfile(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool] | None:
+    try:
+        import rarfile  # type: ignore
+    except ImportError:
+        return None
+
+    with rarfile.RarFile(file_path) as archive:
+        infos = [
+            ArchiveEntryDetail(
+                path=info.filename,
+                size=getattr(info, "file_size", None),
+                modified=format_zip_datetime(info.date_time) if getattr(info, "date_time", None) else "",
+            )
+            for info in archive.infolist()
+            if not info.isdir()
+        ]
+
+    entries, truncated = limited_archive_entry_details(infos)
+    return entries, len(infos), truncated
 
 
 def parse_unrar_list_output(output: str) -> tuple[list[str], int | None, bool]:
@@ -565,6 +810,97 @@ def parse_unrar_list_output(output: str) -> tuple[list[str], int | None, bool]:
     return entries, len(entries), False
 
 
+def parse_unrar_technical_details(output: str) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
+    entries: list[ArchiveEntryDetail] = []
+    current: dict[str, str] = {}
+
+    key_map = {
+        "name": "path",
+        "path": "path",
+        "pathname": "path",
+        "file name": "path",
+        "size": "size",
+        "file size": "size",
+        "modified": "modified",
+        "mtime": "modified",
+        "date": "modified",
+    }
+
+    def flush_current() -> None:
+        if not current:
+            return
+
+        path = normalize_archive_entry(current.get("path", ""))
+
+        if not path:
+            current.clear()
+            return
+
+        size_raw = current.get("size", "")
+        size_match = re.search(r"\d+", size_raw.replace(" ", ""))
+
+        try:
+            size = int(size_match.group(0)) if size_match else None
+        except ValueError:
+            size = None
+
+        entries.append(
+            ArchiveEntryDetail(
+                path=path,
+                size=size,
+                modified=current.get("modified", "")[:16],
+            )
+        )
+        current.clear()
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            flush_current()
+            continue
+
+        if ":" in line:
+            raw_key, value = line.split(":", 1)
+        elif "=" in line:
+            raw_key, value = line.split("=", 1)
+        else:
+            continue
+
+        key = key_map.get(raw_key.strip().lower())
+
+        if not key:
+            continue
+
+        if key == "path" and current.get("path"):
+            flush_current()
+
+        current[key] = value.strip()
+
+        if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
+            return entries, None, True
+
+    flush_current()
+
+    if not entries:
+        raise RuntimeError("technical list не содержит распознанных файлов")
+
+    return entries[:MAX_ARCHIVE_SCAN_ENTRIES], len(entries), len(entries) > MAX_ARCHIVE_SCAN_ENTRIES
+
+
+def read_rar_entry_details_with_bare_list(file_path: Path, exe: str) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
+    completed, error = run_archive_tool([exe, "lb", str(file_path)], timeout=20)
+
+    if completed is None:
+        raise RuntimeError(error or exe)
+
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or exe)
+
+    names, total_entries, truncated = parse_unrar_list_output(completed.stdout)
+    return [ArchiveEntryDetail(path=name) for name in names], total_entries, truncated
+
+
 def read_rar_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
     errors: list[str] = []
 
@@ -583,15 +919,11 @@ def read_rar_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
     )
 
     for exe in seven_zip_tools:
-        completed = subprocess.run(
-            [exe, "l", "-slt", str(file_path)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
+        completed, error = run_archive_tool([exe, "l", "-slt", str(file_path)], timeout=15)
+
+        if completed is None:
+            errors.append(error or exe)
+            continue
 
         if completed.returncode == 0:
             return parse_7z_slt_output(completed.stdout, file_path.name)
@@ -599,24 +931,19 @@ def read_rar_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
         errors.append(completed.stderr.strip() or completed.stdout.strip() or exe)
 
     rar_tools = candidate_archive_tools(
-        names=["unrar", "rar", "winrar", "UnRAR.exe", "Rar.exe", "WinRAR.exe"],
+        names=["unrar", "rar", "UnRAR.exe", "Rar.exe"],
         common_relative_paths=[
             "WinRAR/UnRAR.exe",
             "WinRAR/Rar.exe",
-            "WinRAR/WinRAR.exe",
         ],
     )
 
     for exe in rar_tools:
-        completed = subprocess.run(
-            [exe, "lb", str(file_path)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
+        completed, error = run_archive_tool([exe, "lb", str(file_path)], timeout=15)
+
+        if completed is None:
+            errors.append(error or exe)
+            continue
 
         if completed.returncode == 0:
             return parse_unrar_list_output(completed.stdout)
@@ -629,6 +956,67 @@ def read_rar_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
         "для .rar не найден rarfile, 7z/7za или WinRAR/UnRAR в PATH/Program Files"
         f"{suffix}"
     )
+
+
+def read_rar_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
+    errors: list[str] = []
+
+    try:
+        rarfile_result = read_rar_entry_details_with_rarfile(file_path)
+    except Exception as e:
+        rarfile_result = None
+        errors.append(f"rarfile: {e}")
+
+    if rarfile_result is not None:
+        return rarfile_result
+
+    seven_zip_tools = candidate_archive_tools(
+        names=["7z", "7za", "7z.exe", "7za.exe"],
+        common_relative_paths=["7-Zip/7z.exe", "7-Zip/7za.exe"],
+    )
+
+    for exe in seven_zip_tools:
+        completed, error = run_archive_tool([exe, "l", "-slt", str(file_path)], timeout=20)
+
+        if completed is None:
+            errors.append(error or exe)
+            continue
+
+        if completed.returncode == 0:
+            return parse_7z_slt_details(completed.stdout, file_path.name)
+
+        errors.append(completed.stderr.strip() or completed.stdout.strip() or exe)
+
+    rar_tools = candidate_archive_tools(
+        names=["unrar", "rar", "UnRAR.exe", "Rar.exe"],
+        common_relative_paths=[
+            "WinRAR/UnRAR.exe",
+            "WinRAR/Rar.exe",
+        ],
+    )
+
+    for exe in rar_tools:
+        completed, error = run_archive_tool([exe, "lt", str(file_path)], timeout=20)
+
+        if completed is None:
+            errors.append(error or exe)
+            continue
+
+        if completed.returncode == 0:
+            try:
+                return parse_unrar_technical_details(completed.stdout)
+            except Exception as e:
+                errors.append(f"{exe} lt parse: {e}")
+        else:
+            errors.append(completed.stderr.strip() or completed.stdout.strip() or exe)
+
+    for exe in rar_tools:
+        try:
+            return read_rar_entry_details_with_bare_list(file_path, exe)
+        except Exception as e:
+            errors.append(f"{exe} lb: {e}")
+
+    raise RuntimeError("; ".join(errors) or "не удалось прочитать подробности rar")
 
 
 def classify_archive_entries(entries: list[str]) -> tuple[str | None, str]:
@@ -676,6 +1064,310 @@ def classify_archive_entries(entries: list[str]) -> tuple[str | None, str]:
         return "blender_assets", "найден .blend файл"
 
     return None, ""
+
+
+def read_archive_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
+    suffix = archive_suffix(file_path)
+
+    if suffix == ".zip":
+        return read_zip_entry_details(file_path)
+
+    if suffix in {".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"}:
+        return read_tar_entry_details(file_path)
+
+    if suffix == ".7z":
+        return read_7z_entry_details(file_path)
+
+    if suffix == ".rar":
+        return read_rar_entry_details(file_path)
+
+    raise RuntimeError("неподдерживаемый архив")
+
+
+def archive_detail_key_file(entry: ArchiveEntryDetail) -> bool:
+    path = entry.path.lower()
+    name = Path(path).name
+    suffix = Path(path).suffix.lower()
+
+    if name in {"__init__.py", "blender_manifest.toml", "package.json", "manifest.json"}:
+        return True
+
+    if suffix in {
+        ".blend",
+        ".py",
+        ".json",
+        ".toml",
+        ".txt",
+        ".md",
+        ".exe",
+        ".dll",
+        ".hda",
+        ".uplugin",
+        ".uproject",
+        ".unitypackage",
+        ".zxp",
+        ".ccx",
+    }:
+        return True
+
+    return False
+
+
+def format_archive_entry_detail(entry: ArchiveEntryDetail) -> str:
+    size = format_size(entry.size) if entry.size is not None else "?"
+    modified = entry.modified or "?"
+    return f"{entry.path} | size={size} | modified={modified}"
+
+
+def nested_archive_entries(entries: list[ArchiveEntryDetail]) -> list[ArchiveEntryDetail]:
+    nested = [
+        entry
+        for entry in entries
+        if archive_suffix(Path(entry.path))
+    ]
+    return sorted(nested, key=lambda entry: entry.size or 0, reverse=True)[:MAX_NESTED_ARCHIVES_PER_PARENT]
+
+
+def safe_nested_output_path(tmp_dir: Path, entry_path: str) -> Path:
+    name = Path(entry_path.replace("\\", "/")).name
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" ._")
+
+    if not name:
+        name = "nested_archive"
+
+    return tmp_dir / name
+
+
+def extract_nested_archive(parent_path: Path, entry_path: str, output_path: Path) -> None:
+    suffix = archive_suffix(parent_path)
+
+    if suffix == ".zip":
+        with zipfile.ZipFile(parent_path) as archive:
+            with archive.open(entry_path) as src, output_path.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+        return
+
+    if suffix in {".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"}:
+        with tarfile.open(parent_path, mode="r:*") as archive:
+            member = archive.getmember(entry_path)
+            src = archive.extractfile(member)
+
+            if src is None:
+                raise RuntimeError("tar member cannot be extracted as file")
+
+            with src, output_path.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+        return
+
+    if suffix == ".rar":
+        import rarfile  # type: ignore
+
+        with rarfile.RarFile(parent_path) as archive:
+            with archive.open(entry_path) as src, output_path.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+        return
+
+    if suffix == ".7z":
+        import py7zr  # type: ignore
+
+        with py7zr.SevenZipFile(parent_path, mode="r") as archive:
+            archive.extract(path=output_path.parent, targets=[entry_path])
+
+        extracted_path = output_path.parent / entry_path
+
+        if not extracted_path.exists():
+            raise RuntimeError("py7zr did not extract requested nested archive")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(extracted_path), str(output_path))
+        return
+
+    raise RuntimeError("parent archive type does not support nested extraction")
+
+
+def format_nested_archive_report(parent_path: Path, nested_entry: ArchiveEntryDetail) -> tuple[str, list[ArchiveEntryDetail]]:
+    if nested_entry.size is not None and nested_entry.size > MAX_NESTED_ARCHIVE_BYTES:
+        return (
+            f"nested_archive: {nested_entry.path} | size={format_size(nested_entry.size)} | skipped=too_large",
+            [],
+        )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="file_sorter_nested_") as tmp:
+            tmp_dir = Path(tmp)
+            nested_path = safe_nested_output_path(tmp_dir, nested_entry.path)
+            extract_nested_archive(parent_path, nested_entry.path, nested_path)
+            entries, total_entries, truncated = read_archive_entry_details(nested_path)
+    except Exception as e:
+        return f"nested_archive: {nested_entry.path} | scan_error={e}", []
+
+    known_sizes = [entry.size for entry in entries if entry.size is not None]
+    paths = [entry.path for entry in entries]
+    classification, reason = classify_archive_entries(paths)
+    sample = entries[:MAX_DUPLICATE_ARCHIVE_REPORT_FILES]
+    key_entries = [entry for entry in entries if archive_detail_key_file(entry)][:MAX_DUPLICATE_ARCHIVE_REPORT_FILES]
+    report = "\n".join(
+        [
+            f"nested_archive: {nested_entry.path}",
+            f"  entries_scanned: {len(entries)}",
+            f"  total_entries: {total_entries if total_entries is not None else 'unknown'}",
+            f"  truncated: {truncated}",
+            f"  uncompressed_size_scanned: {format_size(sum(known_sizes)) if known_sizes else 'unknown'}",
+            f"  classification: {classification or 'unknown'}",
+            f"  classification_reason: {reason or 'no strong deterministic signal'}",
+            "  key_files:",
+            *[f"    - {format_archive_entry_detail(entry)}" for entry in key_entries],
+            "  sample_files:",
+            *[f"    - {format_archive_entry_detail(entry)}" for entry in sample],
+        ]
+    )
+
+    prefixed_entries = [
+        ArchiveEntryDetail(
+            path=f"{nested_entry.path}::{entry.path}",
+            size=entry.size,
+            modified=entry.modified,
+        )
+        for entry in entries
+    ]
+    return report, prefixed_entries
+
+
+def format_duplicate_archive_deep_report(file_id: int, file_path: Path) -> tuple[str, list[ArchiveEntryDetail]]:
+    if not archive_suffix(file_path):
+        return f"[{file_id}] {file_path.name}\narchive: no\n", []
+
+    try:
+        entries, total_entries, truncated = read_archive_entry_details(file_path)
+    except Exception as e:
+        return (
+            f"[{file_id}] {file_path.name}\n"
+            f"archive: yes\n"
+            f"deep_scan_error: {e}\n"
+        ), []
+
+    paths = [entry.path for entry in entries]
+    classification, reason = classify_archive_entries(paths)
+    known_sizes = [entry.size for entry in entries if entry.size is not None]
+    total_size = sum(known_sizes)
+    extension_counts: dict[str, int] = {}
+    modified_values = [entry.modified for entry in entries if entry.modified]
+
+    for entry in entries:
+        suffix = Path(entry.path).suffix.lower() or "<no_ext>"
+        extension_counts[suffix] = extension_counts.get(suffix, 0) + 1
+
+    ext_summary = ", ".join(
+        f"{suffix}:{count}"
+        for suffix, count in sorted(extension_counts.items(), key=lambda item: (-item[1], item[0]))[:12]
+    )
+    largest_entries = sorted(entries, key=lambda entry: entry.size or 0, reverse=True)[
+        :MAX_DUPLICATE_ARCHIVE_REPORT_FILES
+    ]
+    key_entries = [
+        entry
+        for entry in entries
+        if archive_detail_key_file(entry)
+    ][:MAX_DUPLICATE_ARCHIVE_REPORT_FILES]
+    sample_entries = entries[:MAX_DUPLICATE_ARCHIVE_REPORT_FILES]
+    nested_reports: list[str] = []
+    nested_detail_entries: list[ArchiveEntryDetail] = []
+
+    for nested_entry in nested_archive_entries(entries):
+        nested_report, nested_entries = format_nested_archive_report(file_path, nested_entry)
+        nested_reports.append(nested_report)
+        nested_detail_entries.extend(nested_entries)
+
+    parts = [
+        f"[{file_id}] {file_path.name}",
+        "archive: yes",
+        f"type: {archive_suffix(file_path).lstrip('.')}",
+        f"entries_scanned: {len(entries)}",
+        f"total_entries: {total_entries if total_entries is not None else 'unknown'}",
+        f"truncated: {truncated}",
+        f"uncompressed_size_scanned: {format_size(total_size) if known_sizes else 'unknown'}",
+        f"modified_range: {min(modified_values) if modified_values else '?'} .. {max(modified_values) if modified_values else '?'}",
+        f"classification: {classification or 'unknown'}",
+        f"classification_reason: {reason or 'no strong deterministic signal'}",
+        f"extension_counts: {ext_summary or 'none'}",
+        "largest_files:",
+        *[f"  - {format_archive_entry_detail(entry)}" for entry in largest_entries],
+        "key_files:",
+        *[f"  - {format_archive_entry_detail(entry)}" for entry in key_entries],
+        "sample_files:",
+        *[f"  - {format_archive_entry_detail(entry)}" for entry in sample_entries],
+    ]
+
+    if nested_reports:
+        parts.extend(
+            [
+                "nested_archives:",
+                *nested_reports,
+            ]
+        )
+
+    return "\n".join(parts) + "\n", entries + nested_detail_entries
+
+
+def format_archive_structure_comparison(details_by_id: dict[int, list[ArchiveEntryDetail]], id_to_path: dict[int, Path]) -> str:
+    if len(details_by_id) < 2:
+        return "not enough archive details for comparison"
+
+    path_sets = {
+        file_id: {entry.path.lower() for entry in entries}
+        for file_id, entries in details_by_id.items()
+    }
+    basename_sets = {
+        file_id: {Path(entry.path.lower()).name for entry in entries}
+        for file_id, entries in details_by_id.items()
+    }
+    all_path_sets = list(path_sets.values())
+    common_paths = set.intersection(*all_path_sets) if all_path_sets else set()
+    lines = [
+        f"common_exact_paths_count: {len(common_paths)}",
+        "common_exact_paths_sample:",
+        *[f"  - {path}" for path in sorted(common_paths)[:MAX_DUPLICATE_ARCHIVE_UNIQUE_PATHS]],
+    ]
+
+    for file_id, paths in path_sets.items():
+        other_paths: set[str] = set()
+        other_basenames: set[str] = set()
+
+        for other_id, other_set in path_sets.items():
+            if other_id != file_id:
+                other_paths |= other_set
+                other_basenames |= basename_sets[other_id]
+
+        unique_paths = paths - other_paths
+        common_basenames = basename_sets[file_id] & other_basenames
+        lines.extend(
+            [
+                f"[{file_id}] {id_to_path[file_id].name}",
+                f"  unique_exact_paths_count: {len(unique_paths)}",
+                "  unique_exact_paths_sample:",
+                *[f"    - {path}" for path in sorted(unique_paths)[:MAX_DUPLICATE_ARCHIVE_UNIQUE_PATHS]],
+                f"  common_basenames_count: {len(common_basenames)}",
+                "  common_basenames_sample:",
+                *[f"    - {name}" for name in sorted(common_basenames)[:MAX_DUPLICATE_ARCHIVE_UNIQUE_PATHS]],
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def format_duplicate_archives_deep_review(archive_ids: list[int], id_to_path: dict[int, Path]) -> str:
+    reports: list[str] = []
+    details_by_id: dict[int, list[ArchiveEntryDetail]] = {}
+
+    for file_id in archive_ids:
+        report, entries = format_duplicate_archive_deep_report(file_id, id_to_path[file_id])
+        reports.append(report)
+
+        if entries:
+            details_by_id[file_id] = entries
+
+    comparison = format_archive_structure_comparison(details_by_id, id_to_path)
+    return "\n\n".join(reports + ["Archive structure comparison:", comparison])
 
 
 def inspect_archive(file_path: Path) -> ArchiveInspection:
@@ -834,6 +1526,23 @@ COMPACT_DROP_WORDS = (
     "x64",
     "x86",
 )
+DUPLICATE_GENERIC_NAME_TOKENS = {
+    "procedural",
+    "prcdrl",
+    "addon",
+    "addons",
+    "asset",
+    "assets",
+    "pack",
+    "preset",
+    "presets",
+    "plugin",
+    "plugins",
+    "texture",
+    "textures",
+    "material",
+    "materials",
+}
 
 
 def remove_known_suffix(filename: str) -> str:
@@ -882,6 +1591,12 @@ def duplicate_similarity(left: str, right: str) -> float:
     if not left_tokens or not right_tokens:
         return ratio
 
+    shorter_tokens = left_tokens if len(left_tokens) <= len(right_tokens) else right_tokens
+    longer_tokens = right_tokens if len(left_tokens) <= len(right_tokens) else left_tokens
+
+    if len(shorter_tokens) >= 2 and shorter_tokens <= longer_tokens:
+        return 0.92
+
     jaccard = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
     return max(ratio, jaccard)
 
@@ -918,7 +1633,12 @@ def duplicate_files_look_related(left: Path, right: Path) -> bool:
     if not left_compact or not right_compact:
         return False
 
-    if left_compact in right_compact or right_compact in left_compact:
+    shorter_compact = left_compact if len(left_compact) <= len(right_compact) else right_compact
+
+    if (
+        shorter_compact not in DUPLICATE_GENERIC_NAME_TOKENS
+        and (left_compact in right_compact or right_compact in left_compact)
+    ):
         return True
 
     if SequenceMatcher(None, left_compact, right_compact).ratio() >= 0.88:
@@ -930,7 +1650,12 @@ def duplicate_files_look_related(left: Path, right: Path) -> bool:
     if len(left_skeleton) < 4 or len(right_skeleton) < 4:
         return False
 
-    if left_skeleton in right_skeleton or right_skeleton in left_skeleton:
+    shorter_skeleton = left_skeleton if len(left_skeleton) <= len(right_skeleton) else right_skeleton
+
+    if (
+        shorter_skeleton not in DUPLICATE_GENERIC_NAME_TOKENS
+        and (left_skeleton in right_skeleton or right_skeleton in left_skeleton)
+    ):
         return True
 
     return SequenceMatcher(None, left_skeleton, right_skeleton).ratio() >= 0.86
@@ -1304,6 +2029,7 @@ def duplicate_hint_tokens(file_path: Path) -> list[str]:
         "crack",
         "only",
         "part",
+        "procedural",
     }
     tokens = [token for token in tokens if token not in stop_words]
 
@@ -1315,6 +2041,7 @@ def duplicate_hint_tokens(file_path: Path) -> list[str]:
     if len(skeleton) >= 5:
         tokens.append(skeleton)
 
+    tokens = [token for token in tokens if token not in stop_words]
     return list(dict.fromkeys(tokens))
 
 
@@ -1482,6 +2209,8 @@ Return ONLY one JSON object:
       "confidence": 0.0,
       "keep": 1,
       "delete": [2, 3],
+      "structure_override": false,
+      "analysis": "detailed Russian comparison of archive structure, filenames, sizes and dates",
       "reason": "short Russian reason"
     }}
   ],
@@ -1585,6 +2314,8 @@ Rules:
                 "confidence": confidence,
                 "keep": keep_id,
                 "delete": delete_ids,
+                "structure_override": bool(raw_group.get("structure_override", False)),
+                "analysis": str(raw_group.get("analysis", "")).replace('"', "'").strip(),
                 "reason": str(raw_group.get("reason", "")).replace('"', "'").strip(),
             }
         )
@@ -1686,6 +2417,8 @@ def validate_llm_duplicate_groups(data: dict, id_to_path: dict[int, Path]) -> li
                 "confidence": confidence,
                 "keep": keep_id,
                 "delete": delete_ids,
+                "structure_override": bool(raw_group.get("structure_override", False)),
+                "analysis": str(raw_group.get("analysis", "")).replace('"', "'").strip(),
                 "reason": str(raw_group.get("reason", "")).replace('"', "'").strip(),
             }
         )
@@ -1751,10 +2484,31 @@ def group_file_ids(group: dict) -> set[int]:
     return {int(file_id) for file_id in [group["keep"], *group["delete"]]}
 
 
+def prune_duplicate_outlier_ids(
+    keep_id: int,
+    delete_ids: list[int],
+    id_to_path: dict[int, Path],
+) -> tuple[list[int], list[int]]:
+    keep_path = id_to_path[keep_id]
+    kept_delete_ids: list[int] = []
+    outlier_ids: list[int] = []
+
+    for file_id in delete_ids:
+        file_path = id_to_path[file_id]
+
+        if duplicate_files_look_related(file_path, keep_path):
+            kept_delete_ids.append(file_id)
+        else:
+            outlier_ids.append(file_id)
+
+    return kept_delete_ids, outlier_ids
+
+
 def enforce_llm_duplicate_priority(
     refined_groups: list[dict],
     source_groups: list[dict],
     id_to_path: dict[int, Path],
+    include_source_candidates: bool = False,
 ) -> list[dict]:
     fixed: list[dict] = []
     used_delete_ids: set[int] = set()
@@ -1762,11 +2516,12 @@ def enforce_llm_duplicate_priority(
     for group in refined_groups:
         candidate_ids = group_file_ids(group)
 
-        for source_group in source_groups:
-            source_ids = group_file_ids(source_group)
+        if include_source_candidates:
+            for source_group in source_groups:
+                source_ids = group_file_ids(source_group)
 
-            if candidate_ids & source_ids:
-                candidate_ids |= source_ids
+                if candidate_ids & source_ids:
+                    candidate_ids |= source_ids
 
         candidate_ids = {
             file_id
@@ -1780,25 +2535,41 @@ def enforce_llm_duplicate_priority(
         if group_contains_multipart_set_parts(sorted(candidate_ids), id_to_path):
             continue
 
-        keep_id = max(candidate_ids, key=lambda file_id: duplicate_file_score(id_to_path[file_id]))
+        structure_override = bool(group.get("structure_override", False))
+        old_keep = group["keep"]
+        keep_id = old_keep if structure_override and old_keep in candidate_ids else max(
+            candidate_ids,
+            key=lambda file_id: duplicate_file_score(id_to_path[file_id]),
+        )
         delete_ids = [
             file_id
             for file_id in sorted(candidate_ids)
             if file_id != keep_id and file_id not in used_delete_ids
         ]
+        original_delete_ids = delete_ids[:]
+        delete_ids, outlier_ids = prune_duplicate_outlier_ids(keep_id, delete_ids, id_to_path)
 
-        if not delete_ids:
-            continue
+        if not delete_ids and original_delete_ids:
+            delete_ids = original_delete_ids
+            outlier_ids = []
 
         used_delete_ids.update(delete_ids)
-        old_keep = group["keep"]
         reason = group["reason"]
 
-        if keep_id != old_keep:
+        if structure_override:
+            reason = (
+                f"{reason}; выбор LLM оставлен по deep-анализу структуры архива "
+                f"(structure_override=true)"
+            )
+        elif keep_id != old_keep:
             reason = (
                 f"{reason}; исправлено правилом приоритета: оставить "
                 f"{id_to_path[keep_id].name}, потому что у него выше версия/дата/размер по правилу выбора"
             )
+
+        if outlier_ids:
+            outlier_names = ", ".join(f"[{file_id}] {id_to_path[file_id].name}" for file_id in outlier_ids)
+            reason = f"{reason}; исключены нерелевантные кандидаты: {outlier_names}"
 
         fixed.append(
             {
@@ -1895,10 +2666,7 @@ def refine_llm_duplicate_groups_with_archives(
         ensure_ascii=False,
         indent=2,
     )
-    archive_details = "\n".join(
-        format_duplicate_archive_detail(file_id, id_to_path[file_id])
-        for file_id in archive_ids
-    )
+    archive_details = format_duplicate_archives_deep_review(archive_ids, id_to_path)
     candidate_details = "\n".join(
         (
             f"[{record['id']}] {record['name']} | size={record['size']} "
@@ -1916,7 +2684,7 @@ def refine_llm_duplicate_groups_with_archives(
 
     system_prompt = f"""\
 You are a cautious duplicate-file review assistant.
-You already proposed duplicate groups. Now review them using candidate file details and quick archive contents when available.
+You already proposed duplicate groups. Now review them using candidate file details and detailed archive structure reports when available.
 
 Return ONLY one JSON object:
 {{
@@ -1926,6 +2694,8 @@ Return ONLY one JSON object:
       "confidence": 0.0,
       "keep": 1,
       "delete": [2, 3],
+      "structure_override": false,
+      "analysis": "detailed Russian comparison of archive structure, filenames, sizes and dates",
       "reason": "short Russian reason"
     }}
   ]
@@ -1939,18 +2709,25 @@ Rules:
 5. Extract and compare versions yourself from filenames. Version patterns can be diverse: v1.2.6, 126 meaning 1.2.6 for compact product names, 2025.3.3, 20.0.5.17637, R25, beta/build/release suffixes.
 6. Treat trailing zero version parts as equal: 2.2.6.0 equals 2.2.6. Use comparable_version for that comparison.
 7. Include all visible versions of the same product family in one group; do not ignore a newer version candidate.
-8. Priority for keep/delete: newest comparable_version first; if versions are equal or absent, newer modified date; if modified date is the same day, larger size.
-9. Never keep an older version only because its archive contents look larger, fuller, or more reliable. If the newer file is a different product, omit the group instead.
+8. Baseline priority for keep/delete: newest comparable_version first; if versions are equal or absent, newer modified date; if modified date is the same day, larger size.
+9. Deep archive structure can override the baseline when it proves the baseline winner only has redundant junk, duplicate copies, download-site files, cache/backup files, or renamed duplicate content.
 10. A typo, abbreviation, or compact spelling in the filename does not make a newer version worse by itself.
-11. Archive quick scans are partial evidence; do not call a file "full" or "only installer" unless the sample entries clearly prove it.
+11. Archive structure reports are evidence from archive catalogs; do not call a file "full" or "only installer" unless the listed entries clearly prove it.
 12. Compare file size only by the numeric size_bytes field. Do not claim a file is smaller/larger unless size_bytes proves it.
 13. Multipart archives like part1/part2 are usually a set, not duplicates. Do not mark one part for deletion unless the same part is duplicated.
 14. A plugin/addon/preset for an application is not a duplicate of the host application itself.
-15. The Strict local rule report is authoritative for version/date/size ordering. Follow strict_keep unless archive contents prove the candidates are different products.
-16. Never suggest deleting all files in a group.
-17. No action will be automatic; user will confirm manually.
-18. Return at most {LLM_DUPLICATE_MAX_GROUPS} groups.
-19. In reason, mention the version comparison you used.
+15. If a report contains nested_archives, treat their nested contents as part of that candidate. Do not call an outer archive empty/broken just because the useful files are inside a nested archive.
+16. Treat the Strict local rule report as a baseline recommendation, not a command. You may override strict_keep if detailed archive structure proves another file is cleaner or equivalent.
+17. If one archive is a superset of another, decide whether the extra files are valuable main content or removable noise. Common noise examples: duplicate filenames with suffixes like copy/backup/old/blend1, CGDownload/html/url/readme ads, metadata, cache, temp files, thumbnails.
+18. If core content is identical and the only meaningful difference is redundant/noise files, prefer the cleaner archive even if it is smaller or older.
+19. If extra files are real assets, source files, presets, textures, examples, or newer main content, prefer the fuller archive.
+20. If internal evidence is insufficient to tell whether extra files are noise or valuable content, keep the baseline winner but state uncertainty.
+21. Set structure_override=true only when archive structure evidence is strong enough to override the baseline version/date/size winner.
+22. Never suggest deleting all files in a group.
+23. No action will be automatic; user will confirm manually.
+24. Return at most {LLM_DUPLICATE_MAX_GROUPS} groups.
+25. Fill "analysis" with a careful Russian comparison: external filenames, versions, archive file counts, internal key files, nested archive contents, internal sizes/dates, common paths, unique paths, whether extras look useful or redundant/noise, and uncertainty.
+26. In reason, give the short final recommendation.
 """
 
     raw = call_llm_raw(
@@ -1961,8 +2738,8 @@ Rules:
                 "content": (
                     f"Original candidate groups:\n{original_groups}\n\n"
                     f"Candidate file details:\n{candidate_details}\n\n"
-                    f"Strict local rule report:\n{rule_report}\n\n"
-                    f"Archive quick scans:\n{archive_details}"
+                    f"Baseline local rule report:\n{rule_report}\n\n"
+                    f"Detailed archive structure reports:\n{archive_details}"
                 ),
             },
         ]
@@ -2011,6 +2788,14 @@ def print_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], index: i
             f"version: {format_duplicate_version(file_path)}"
         )
 
+    analysis = str(group.get("analysis", "")).strip()
+
+    if analysis:
+        print("\n  Анализ LLM:")
+
+        for line in analysis.splitlines():
+            print(f"    {line}")
+
     print(f"  Причина: {group['reason']}")
 
 
@@ -2031,11 +2816,54 @@ def print_rejected_duplicate_hints(rejected_hints: list[dict], id_to_path: dict[
         print(f"       └─ {item['reason']}")
 
 
-def apply_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], root: Path) -> tuple[str, int]:
+def print_llm_keep_selection(group: dict, id_to_path: dict[int, Path]) -> None:
+    keep_path = id_to_path[group["keep"]]
     delete_files = [id_to_path[file_id] for file_id in group["delete"] if id_to_path[file_id].exists()]
 
+    print(f"  [dup] Теперь оставить: [{group['keep']}] {keep_path.name}")
+    print("  [dup] Остальные по текущему выбору:")
+
+    for file_path in delete_files:
+        print(f"    - {file_path.name}")
+
+
+def apply_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], root: Path) -> tuple[str, int]:
+    candidate_ids = sorted(group_file_ids(group))
+    current_group = {
+        **group,
+        "delete": [
+            file_id
+            for file_id in group["delete"]
+            if file_id in id_to_path and id_to_path[file_id].exists()
+        ],
+    }
+
+    def set_manual_keep(file_id: int) -> bool:
+        if file_id not in candidate_ids or file_id not in id_to_path or not id_to_path[file_id].exists():
+            print(f"  [!] ID {file_id} нет в этой группе или файл уже недоступен.")
+            return False
+
+        current_group["keep"] = file_id
+        current_group["delete"] = [
+            candidate_id
+            for candidate_id in candidate_ids
+            if candidate_id != file_id
+            and candidate_id in id_to_path
+            and id_to_path[candidate_id].exists()
+        ]
+        current_group["reason"] = f"выбор пользователя: оставить {id_to_path[file_id].name}"
+        print_llm_keep_selection(current_group, id_to_path)
+        return True
+
+    print("  Команды: d=удалить предложенные, m=переместить предложенные, k ID=выбрать что оставить, km ID=выбрать и переместить остальные, s=пропустить, q=выйти")
+
     while True:
-        choice = read_input("\n  duplicates_llm [d=delete, m=move, s=skip, q=quit]> ").strip().lower()
+        delete_files = [
+            id_to_path[file_id]
+            for file_id in current_group["delete"]
+            if file_id in id_to_path and id_to_path[file_id].exists()
+        ]
+        choice = read_input("\n  duplicates_llm [d/m/k ID/km ID/s/q]> ").strip().lower()
 
         if choice == "q":
             return "quit", 0
@@ -2043,6 +2871,40 @@ def apply_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], root: Pa
         if choice == "s":
             print("  [dup] Группа пропущена.")
             return "done", 0
+
+        if choice.startswith("k ") or choice.startswith("keep "):
+            parts = choice.split(maxsplit=1)
+
+            if len(parts) != 2 or not parts[1].isdigit():
+                print("  [!] Формат: k ID")
+                continue
+
+            set_manual_keep(int(parts[1]))
+            continue
+
+        if choice.startswith("km "):
+            parts = choice.split(maxsplit=1)
+
+            if len(parts) != 2 or not parts[1].isdigit():
+                print("  [!] Формат: km ID")
+                continue
+
+            if not set_manual_keep(int(parts[1])):
+                continue
+
+            delete_files = [
+                id_to_path[file_id]
+                for file_id in current_group["delete"]
+                if file_id in id_to_path and id_to_path[file_id].exists()
+            ]
+
+            if ask_yes_no(
+                f"  Переместить {len(delete_files)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
+            ):
+                moved = move_duplicate_files(root, delete_files)
+                return ("done", 1) if moved else ("done", 0)
+
+            continue
 
         if choice == "m":
             if ask_yes_no(
@@ -2065,7 +2927,7 @@ def apply_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], root: Pa
 
             continue
 
-        print("  [!] Введите d, m, s или q.")
+        print("  [!] Введите d, m, k ID, km ID, s или q.")
 
 
 def apply_duplicate_command(
@@ -2185,7 +3047,23 @@ def ensure_stdin_reader() -> queue.Queue[str | None]:
 
         def reader() -> None:
             while True:
-                line = sys.stdin.readline()
+                try:
+                    line = sys.stdin.readline()
+                except UnicodeDecodeError:
+                    try:
+                        raw_line = sys.stdin.buffer.readline()
+                    except Exception:
+                        _stdin_queue.put(None)
+                        break
+
+                    if raw_line == b"":
+                        _stdin_queue.put(None)
+                        break
+
+                    line = raw_line.decode("utf-8", errors="replace")
+                except Exception:
+                    _stdin_queue.put(None)
+                    break
 
                 if line == "":
                     _stdin_queue.put(None)
@@ -2209,7 +3087,15 @@ def read_input(prompt: str = "") -> str:
     line = stdin_queue.get()
 
     if line is None:
-        raise EOFError
+        try:
+            return input()
+        except UnicodeDecodeError:
+            raw_line = sys.stdin.buffer.readline()
+
+            if raw_line == b"":
+                raise EOFError
+
+            return raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
 
     return line
 
@@ -3586,6 +4472,8 @@ def cmd_duplicates_llm() -> None:
     print("  Действия для каждой группы:")
     print("    d — удалить предложенные файлы после подтверждения")
     print(f"    m — переместить предложенные файлы в {DUPLICATE_REVIEW_FOLDER}/")
+    print("    k ID — вручную выбрать файл, который оставить")
+    print(f"    km ID — выбрать файл и переместить остальные в {DUPLICATE_REVIEW_FOLDER}/")
     print("    s — пропустить")
     print("    q — выйти")
 
