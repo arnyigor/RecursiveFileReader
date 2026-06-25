@@ -16,6 +16,9 @@ import configparser
 import subprocess
 import tarfile
 import zipfile
+import queue
+import threading
+from difflib import SequenceMatcher
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -34,6 +37,11 @@ MAX_DEPTH = 5
 MAX_RECOMMENDATIONS = 5
 MAX_ARCHIVE_SCAN_ENTRIES = 5000
 MAX_ARCHIVE_PREVIEW_ENTRIES = 12
+MIN_RECOMMENDATION_CONFIDENCE = 0.30
+STRONG_LEAD_CONFIDENCE_GAP = 0.45
+STRONG_LEAD_AUTO_SELECT_SECONDS = 3
+DUPLICATE_SIMILARITY_THRESHOLD = 0.88
+DUPLICATE_REVIEW_FOLDER = "_duplicates_review"
 
 DEFAULT_AUTO_SELECT_SECONDS = 60
 
@@ -459,6 +467,25 @@ def parse_7z_slt_output(output: str, archive_name: str) -> tuple[list[str], int 
 
 
 def read_7z_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
+    py7zr_error = ""
+
+    try:
+        import py7zr  # type: ignore
+
+        with py7zr.SevenZipFile(file_path, mode="r") as archive:
+            names = [
+                info.filename
+                for info in archive.list()
+                if getattr(info, "is_file", False)
+            ]
+
+        entries, truncated = limited_archive_entries(names)
+        return entries, len(names), truncated
+    except ImportError:
+        pass
+    except Exception as e:
+        py7zr_error = f"py7zr: {e}"
+
     tools = candidate_archive_tools(
         names=["7z", "7za", "7z.exe", "7za.exe"],
         common_relative_paths=[
@@ -469,9 +496,13 @@ def read_7z_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
     )
 
     if not tools:
-        raise RuntimeError("для .7z не найден 7z/7za в PATH или Program Files")
+        suffix = f"; {py7zr_error}" if py7zr_error else ""
+        raise RuntimeError(
+            "для .7z не найден py7zr или 7z/7za в PATH/Program Files"
+            f"{suffix}"
+        )
 
-    errors: list[str] = []
+    errors: list[str] = [py7zr_error] if py7zr_error else []
 
     for exe in tools:
         completed = subprocess.run(
@@ -507,6 +538,7 @@ def read_rar_entries_with_rarfile(file_path: Path) -> tuple[list[str], int | Non
 
 def parse_unrar_list_output(output: str) -> tuple[list[str], int | None, bool]:
     entries: list[str] = []
+    seen: set[str] = set()
 
     for line in output.splitlines():
         path = normalize_archive_entry(line)
@@ -514,6 +546,14 @@ def parse_unrar_list_output(output: str) -> tuple[list[str], int | None, bool]:
         if not path:
             continue
 
+        # UnRAR/WinRAR can list directories in bare mode. Keep likely files only.
+        if "." not in Path(path).name:
+            continue
+
+        if path in seen:
+            continue
+
+        seen.add(path)
         entries.append(path)
 
         if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
@@ -597,15 +637,34 @@ def classify_archive_entries(entries: list[str]) -> tuple[str | None, str]:
     has_texture = any(Path(name).suffix.lower() in TEXTURE_SUFFIXES for name in lower_entries)
     has_uproject = any(name.endswith(".uproject") for name in lower_entries)
     has_uplugin = any(name.endswith(".uplugin") for name in lower_entries)
-
-    if has_init_py:
-        return "blender_addon", "найден __init__.py внутри архива"
+    has_uasset = any(name.endswith(".uasset") for name in lower_entries)
+    has_hda = any(name.endswith((".hda", ".hdalc", ".hdanc")) for name in lower_entries)
+    has_unitypackage = any(name.endswith(".unitypackage") for name in lower_entries)
+    has_adobe_extension = any(
+        name.endswith((".zxp", ".ccx", ".jsx", ".jsxbin", ".atn", ".abr"))
+        for name in lower_entries
+    )
 
     if has_uproject:
         return "ue_project", "найден .uproject внутри архива"
 
     if has_uplugin:
         return "ue_plugin", "найден .uplugin внутри архива"
+
+    if has_hda:
+        return "houdini_asset", "найдены Houdini Digital Assets (.hda)"
+
+    if has_unitypackage:
+        return "unity_package", "найден .unitypackage внутри архива"
+
+    if has_adobe_extension:
+        return "adobe_extension", "найдены Adobe/Photoshop extension файлы"
+
+    if has_uasset:
+        return "ue_content", "найдены Unreal Engine content файлы (.uasset)"
+
+    if has_init_py:
+        return "blender_addon", "найден __init__.py внутри архива"
 
     if has_blend and has_texture:
         return "blender_assets", "найдены .blend файл и текстуры"
@@ -682,6 +741,14 @@ def print_archive_inspection(info: ArchiveInspection) -> None:
         signals.append(".uproject")
     if info.has_uplugin:
         signals.append(".uplugin")
+    if info.classification == "houdini_asset":
+        signals.append(".hda")
+    if info.classification == "ue_content":
+        signals.append(".uasset")
+    if info.classification == "unity_package":
+        signals.append(".unitypackage")
+    if info.classification == "adobe_extension":
+        signals.append("Adobe extension")
 
     if signals:
         print(f"  [archive] Признаки: {', '.join(signals)}")
@@ -728,8 +795,472 @@ def resolve_destination(dest_folder: Path, filename: str) -> Path:
 
 
 # ─────────────────────────────────────────────
-#  Ввод с таймаутом
+#  Поиск дублей и похожих версий в root
 # ─────────────────────────────────────────────
+
+VERSION_PATTERNS = (
+    r"\bv?\d+(?:[._-]\d+){1,4}[a-z]?\b",
+    r"\bv\d+\b",
+    r"\bver(?:sion)?[._ -]*\d+\b",
+    r"\brev(?:ision)?[._ -]*\d+\b",
+    r"\bbuild[._ -]*\d+\b",
+    r"\bcopy\b",
+    r"\bcopie\b",
+    r"\bкопия\b",
+    r"\bduplicate\b",
+    r"\bfinal\b",
+    r"\bold\b",
+    r"\bnew\b",
+)
+
+VERSION_EXTRACT_RE = re.compile(
+    r"(?i)(?:^|[^a-z0-9])(?:v|ver(?:sion)?[._ -]*)?(\d+(?:[._-]\d+){0,5}[a-z]?)(?=$|[^a-z0-9])"
+)
+
+
+def remove_known_suffix(filename: str) -> str:
+    lower_name = filename.lower()
+    suffix = archive_suffix(Path(filename))
+
+    if suffix:
+        return filename[: -len(suffix)]
+
+    return filename[: -len(Path(lower_name).suffix)] if Path(lower_name).suffix else filename
+
+
+def normalize_duplicate_key(file_path: Path) -> str:
+    name = remove_known_suffix(file_path.name).lower()
+    name = re.sub(r"[\[\]{}()]+", " ", name)
+    name = VERSION_EXTRACT_RE.sub(" ", name)
+
+    for pattern in VERSION_PATTERNS:
+        name = re.sub(pattern, " ", name, flags=re.IGNORECASE)
+
+    name = re.sub(r"[_+\-.]+", " ", name)
+    name = re.sub(r"\b(?:x64|x86|win64|win32|windows|macos|linux)\b", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+
+    if not name:
+        return remove_known_suffix(file_path.name).lower().strip()
+
+    return name
+
+
+def duplicate_extension_key(file_path: Path) -> str:
+    if archive_suffix(file_path):
+        return "<archive>"
+
+    return file_path.suffix.lower()
+
+
+def duplicate_similarity(left: str, right: str) -> float:
+    if left == right:
+        return 1.0
+
+    ratio = SequenceMatcher(None, left, right).ratio()
+    left_tokens = set(left.split())
+    right_tokens = set(right.split())
+
+    if not left_tokens or not right_tokens:
+        return ratio
+
+    jaccard = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+    return max(ratio, jaccard)
+
+
+def duplicate_version_tuple(file_path: Path) -> tuple[int, ...] | None:
+    name = remove_known_suffix(file_path.name).lower()
+    matches = list(VERSION_EXTRACT_RE.finditer(name))
+
+    if not matches:
+        return None
+
+    best: tuple[int, ...] | None = None
+
+    for match in matches:
+        raw = match.group(1)
+        parts = re.findall(r"\d+", raw)
+
+        if not parts:
+            continue
+
+        version = tuple(int(part) for part in parts)
+
+        if best is None or version > best:
+            best = version
+
+    return best
+
+
+def duplicate_file_score(file_path: Path) -> tuple[tuple[int, ...], float, int]:
+    version = duplicate_version_tuple(file_path) or ()
+
+    try:
+        mtime = file_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+
+    try:
+        size = file_path.stat().st_size
+    except OSError:
+        size = 0
+
+    return version, mtime, size
+
+
+def format_version_tuple(version: tuple[int, ...] | None) -> str:
+    if not version:
+        return "-"
+
+    return ".".join(str(part) for part in version)
+
+
+def suggest_duplicate_keep(group: list[Path]) -> tuple[int, list[int], str]:
+    scored = [(i, file_path, duplicate_file_score(file_path)) for i, file_path in enumerate(group, 1)]
+    keep_index, keep_path, keep_score = max(scored, key=lambda item: item[2])
+    delete_indexes = [i for i, _, _ in scored if i != keep_index]
+
+    versions = [score[0] for _, _, score in scored if score[0]]
+
+    if versions and len(set(versions)) > 1:
+        reason = (
+            f"оставить более новую версию {format_version_tuple(keep_score[0])}: "
+            f"{keep_path.name}"
+        )
+    else:
+        mtimes = [score[1] for _, _, score in scored]
+
+        if len(set(mtimes)) > 1:
+            reason = f"версии одинаковы/не найдены, оставить более свежий файл: {keep_path.name}"
+        else:
+            reason = f"даты одинаковы, оставить файл большего размера: {keep_path.name}"
+
+    return keep_index, delete_indexes, reason
+
+
+def find_duplicate_groups(files: list[Path]) -> list[list[Path]]:
+    buckets: dict[str, list[tuple[str, Path]]] = {}
+
+    for file_path in files:
+        key = duplicate_extension_key(file_path)
+        buckets.setdefault(key, []).append((normalize_duplicate_key(file_path), file_path))
+
+    groups: list[list[Path]] = []
+
+    for items in buckets.values():
+        pending = items[:]
+
+        while pending:
+            key, file_path = pending.pop(0)
+            group = [(key, file_path)]
+            changed = True
+
+            while changed:
+                changed = False
+                rest: list[tuple[str, Path]] = []
+                group_keys = [item_key for item_key, _ in group]
+
+                for candidate_key, candidate_path in pending:
+                    if any(
+                        duplicate_similarity(candidate_key, group_key)
+                        >= DUPLICATE_SIMILARITY_THRESHOLD
+                        for group_key in group_keys
+                    ):
+                        group.append((candidate_key, candidate_path))
+                        changed = True
+                    else:
+                        rest.append((candidate_key, candidate_path))
+
+                pending = rest
+
+            if len(group) > 1:
+                paths = sorted(
+                    [path for _, path in group],
+                    key=lambda path: (
+                        normalize_duplicate_key(path),
+                        -path.stat().st_mtime if path.exists() else 0,
+                        path.name.lower(),
+                    ),
+                )
+                groups.append(paths)
+
+    groups.sort(key=lambda group: (len(group), group[0].name.lower()), reverse=True)
+    return groups
+
+
+def format_mtime(file_path: Path) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(file_path.stat().st_mtime))
+    except OSError:
+        return "unknown"
+
+
+def print_duplicate_group(group: list[Path], index: int, total: int) -> None:
+    common_key = normalize_duplicate_key(group[0])
+    keep_index, delete_indexes, reason = suggest_duplicate_keep(group)
+
+    print(f"\n{hr('═')}")
+    print(f"  Дубли/версии: группа {index}/{total}")
+    print(f"  Ключ         : {common_key}")
+    print(f"{hr('═')}")
+
+    for i, file_path in enumerate(group, 1):
+        try:
+            size = format_size(file_path.stat().st_size)
+        except OSError:
+            size = "unknown"
+
+        print(
+            f"  [{i:>2}] {file_path.name}\n"
+            f"       size: {size} | modified: {format_mtime(file_path)} | "
+            f"version: {format_version_tuple(duplicate_version_tuple(file_path))} | "
+            f"key: {normalize_duplicate_key(file_path)}"
+        )
+
+    delete_arg = " ".join(str(index) for index in delete_indexes)
+    print(f"\n  [suggest] d {delete_arg}")
+    print(f"        └─ {reason}")
+    print(f"        └─ Быстро применить: a")
+
+
+def parse_duplicate_numbers(raw: str, max_index: int) -> list[int]:
+    numbers: list[int] = []
+
+    for token in re.split(r"[,\s]+", raw.strip()):
+        if not token:
+            continue
+
+        if not token.isdigit():
+            return []
+
+        value = int(token)
+
+        if value < 1 or value > max_index:
+            return []
+
+        if value not in numbers:
+            numbers.append(value)
+
+    return numbers
+
+
+def duplicate_review_dir(root: Path) -> Path:
+    return root / DUPLICATE_REVIEW_FOLDER
+
+
+def move_duplicate_files(root: Path, files: list[Path]) -> int:
+    review_dir = duplicate_review_dir(root)
+    moved = 0
+
+    try:
+        review_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"  [ОШИБКА] Не удалось создать {review_dir}: {e}")
+        return 0
+
+    for file_path in files:
+        if not file_path.exists():
+            continue
+
+        dest_path = resolve_destination(review_dir, file_path.name)
+
+        try:
+            shutil.move(str(file_path), str(dest_path))
+            print(f"  [✓] Перемещено: {file_path.name} → {DUPLICATE_REVIEW_FOLDER}/{dest_path.name}")
+            moved += 1
+        except OSError as e:
+            print(f"  [ОШИБКА] {file_path.name}: {e}")
+
+    return moved
+
+
+def delete_duplicate_files(files: list[Path]) -> int:
+    deleted = 0
+
+    for file_path in files:
+        if not file_path.exists():
+            continue
+
+        try:
+            file_path.unlink()
+            print(f"  [✓] Удалено: {file_path.name}")
+            deleted += 1
+        except OSError as e:
+            print(f"  [ОШИБКА] {file_path.name}: {e}")
+
+    return deleted
+
+
+def apply_duplicate_command(
+    choice: str,
+    group: list[Path],
+    root: Path,
+) -> tuple[str, int]:
+    choice = choice.strip().lower()
+
+    if not choice:
+        return "continue", 0
+
+    if choice == "q":
+        return "quit", 0
+
+    if choice == "s":
+        print("  [dup] Группа пропущена.")
+        return "done", 0
+
+    if choice == "a":
+        _, delete_indexes, _ = suggest_duplicate_keep(group)
+        choice = "d " + " ".join(str(index) for index in delete_indexes)
+
+    parts = choice.split(maxsplit=1)
+    command = parts[0]
+    args = parts[1] if len(parts) > 1 else ""
+
+    if command == "k":
+        numbers = parse_duplicate_numbers(args, len(group))
+
+        if len(numbers) != 1:
+            print("  [!] Формат: k N")
+            return "continue", 0
+
+        keep_index = numbers[0]
+        selected = [
+            file_path
+            for i, file_path in enumerate(group, 1)
+            if i != keep_index
+        ]
+
+        if not selected:
+            print("  [!] Нечего перемещать.")
+            return "continue", 0
+
+        print(f"  Оставляем: {group[keep_index - 1].name}")
+
+        if ask_yes_no(
+            f"  Переместить остальные {len(selected)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
+        ):
+            moved = move_duplicate_files(root, selected)
+            return ("done", 1) if moved else ("continue", 0)
+
+        return "continue", 0
+
+    if command == "m":
+        numbers = parse_duplicate_numbers(args, len(group))
+
+        if not numbers:
+            print("  [!] Формат: m N ...")
+            return "continue", 0
+
+        selected = [group[number - 1] for number in numbers]
+
+        if ask_yes_no(
+            f"  Переместить выбранные {len(selected)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
+        ):
+            moved = move_duplicate_files(root, selected)
+            return ("done", 1) if moved else ("continue", 0)
+
+        return "continue", 0
+
+    if command == "d":
+        numbers = parse_duplicate_numbers(args, len(group))
+
+        if not numbers:
+            print("  [!] Формат: d N ...")
+            return "continue", 0
+
+        selected = [group[number - 1] for number in numbers]
+        print("  Будут удалены:")
+
+        for file_path in selected:
+            print(f"    - {file_path.name}")
+
+        if ask_yes_no("  Удалить выбранные файлы безвозвратно? [y/n]: "):
+            deleted = delete_duplicate_files(selected)
+            return ("done", 1) if deleted else ("continue", 0)
+
+        return "continue", 0
+
+    print("  [!] Неизвестная команда. Используйте k/m/d/s/q.")
+    return "continue", 0
+
+
+# ─────────────────────────────────────────────
+#  Ввод
+# ─────────────────────────────────────────────
+
+_stdin_queue: queue.Queue[str | None] | None = None
+_stdin_reader_started = False
+_stdin_reader_lock = threading.Lock()
+
+
+def ensure_stdin_reader() -> queue.Queue[str | None]:
+    global _stdin_queue, _stdin_reader_started
+
+    if _stdin_queue is None:
+        _stdin_queue = queue.Queue()
+
+    if os.name != "nt":
+        return _stdin_queue
+
+    with _stdin_reader_lock:
+        if _stdin_reader_started:
+            return _stdin_queue
+
+        def reader() -> None:
+            while True:
+                line = sys.stdin.readline()
+
+                if line == "":
+                    _stdin_queue.put(None)
+                    break
+
+                _stdin_queue.put(line.rstrip("\r\n"))
+
+        thread = threading.Thread(target=reader, name="stdin-reader", daemon=True)
+        thread.start()
+        _stdin_reader_started = True
+
+    return _stdin_queue
+
+
+def read_input(prompt: str = "") -> str:
+    if os.name != "nt":
+        return input(prompt)
+
+    stdin_queue = ensure_stdin_reader()
+    print(prompt, end="", flush=True)
+    line = stdin_queue.get()
+
+    if line is None:
+        raise EOFError
+
+    return line
+
+
+def read_input_timeout(prompt: str, timeout_seconds: float) -> str | None:
+    if os.name != "nt":
+        import select
+
+        print(prompt, end="", flush=True)
+        ready, _, _ = select.select([sys.stdin], [], [], timeout_seconds)
+
+        if ready:
+            return sys.stdin.readline().strip()
+
+        return None
+
+    stdin_queue = ensure_stdin_reader()
+    print(prompt, end="", flush=True)
+
+    try:
+        line = stdin_queue.get(timeout=timeout_seconds)
+    except queue.Empty:
+        return None
+
+    if line is None:
+        raise EOFError
+
+    return line
 
 
 def timed_choice(
@@ -755,37 +1286,21 @@ def timed_choice(
     """
 
     if timeout_seconds <= 0:
-        choice = input(prompt).strip().lower()
+        choice = read_input(prompt).strip().lower()
         return choice, False
 
-    print(prompt, end="", flush=True)
+    choice = read_input_timeout(prompt, timeout_seconds)
 
-    if os.name == "nt":
-        print(
-            "\n  [i] Windows/PyCharm: автовыбор отключен для надежного ввода."
-        )
-        choice = input("  Введите выбор и нажмите Enter: ").strip().lower()
-
-        if choice == "":
-            return "__manual__", False
-
-        return choice, False
-
-    else:
-        import select
-
-        ready, _, _ = select.select([sys.stdin], [], [], timeout_seconds)
-
-        if ready:
-            choice = sys.stdin.readline().strip().lower()
-
-            if choice == "":
-                return "__manual__", False
-
-            return choice, False
-
+    if choice is None:
         print()
         return default, True
+
+    choice = choice.strip().lower()
+
+    if choice == "":
+        return "__manual__", False
+
+    return choice, False
 
 
 # ─────────────────────────────────────────────
@@ -840,12 +1355,21 @@ SELECTION LOGIC:
 26. If filename suggests materials, shaders, textures, surfaces, prefer materials/textures folders.
 27. If confidence between a specific folder and generic folder is close, choose the specific folder.
 
+EVIDENCE PRIORITY:
+28. Read the filename first. The filename often contains product name, ecosystem, content type, and version.
+29. Use Archive quick scan second, as confirmation or clarification when filename is ambiguous.
+30. Hard manifest files inside archives are strong evidence: .uproject, .uplugin, .unitypackage, .hda, __init__.py for Blender add-ons.
+31. Dominant internal file extensions are medium evidence: .uasset, .blend, textures, .jsx/.zxp/.ccx.
+32. Do not let generic internal folders such as assets, content, source, textures override an explicit ecosystem or product type in the filename.
+33. If filename and archive contents conflict, prefer hard manifest files; otherwise prefer filename and mention the conflict in reason.
+
 IMPORTANT:
-28. Known standalone VFX/DCC tools and generators must not be classified as UE assets unless the filename explicitly contains UE/Unreal markers.
-29. EmberGen, EmbrGen, LiquiGen, GeoGen, Houdini, Blender, Maya, ZBrush, Substance, Marvelous Designer, World Creator, Gaea, SpeedTree are standalone software/tools unless filename explicitly says they are UE/Unreal assets or plugins.
-30. If Archive quick scan says __init__.py was found, strongly prefer Blender add-on folders.
-31. If Archive quick scan says .blend and textures were found, strongly prefer Blender asset/scene/props folders.
-32. If Archive quick scan says .uproject or .uplugin was found, strongly prefer Unreal Engine folders.
+34. Known standalone VFX/DCC tools and generators must not be classified as UE assets unless the filename explicitly contains UE/Unreal markers.
+35. EmberGen, EmbrGen, LiquiGen, GeoGen, Houdini, Blender, Maya, ZBrush, Substance, Marvelous Designer, World Creator, Gaea, SpeedTree are standalone software/tools unless filename explicitly says they are UE/Unreal assets or plugins.
+36. If Archive quick scan says __init__.py was found and filename does not clearly indicate assets/scenes, strongly prefer Blender add-on folders.
+37. If Archive quick scan says .blend and textures were found and no add-on marker is present, strongly prefer Blender asset/scene/props folders.
+38. If Archive quick scan says .uproject or .uplugin was found, strongly prefer Unreal Engine folders.
+39. If Archive quick scan says .hda was found, strongly prefer Houdini folders.
 """
 
 GENERIC_FOLDER_TOKENS = {
@@ -889,6 +1413,27 @@ def apply_generic_folder_penalty(recs: list[dict]) -> list[dict]:
 
     recs.sort(key=lambda x: x["confidence"], reverse=True)
     return recs
+
+
+def prepare_recommendations_for_choice(recs: list[dict]) -> tuple[list[dict], int | None]:
+    filtered = [
+        r
+        for r in recs
+        if float(r.get("confidence", 0.0)) >= MIN_RECOMMENDATION_CONFIDENCE
+    ]
+
+    if not filtered and recs:
+        filtered = [recs[0]]
+
+    filtered.sort(key=lambda x: x["confidence"], reverse=True)
+
+    if len(filtered) >= 2:
+        lead_gap = float(filtered[0]["confidence"]) - float(filtered[1]["confidence"])
+
+        if lead_gap > STRONG_LEAD_CONFIDENCE_GAP:
+            return [filtered[0]], STRONG_LEAD_AUTO_SELECT_SECONDS
+
+    return filtered[:MAX_RECOMMENDATIONS], None
 
 
 # ─────────────────────────────────────────────
@@ -1105,6 +1650,34 @@ def apply_archive_override(
             forbidden_tokens=["blender", "unity"],
         )
         reason = "В архиве найден .uplugin, это Unreal Engine plugin"
+    elif classification == "ue_content":
+        folder = find_best_existing_folder_by_keywords(
+            flat_paths=flat_paths,
+            preferred_tokens=["ue", "unreal", "assets", "asset", "content"],
+            forbidden_tokens=["blender", "unity"],
+        )
+        reason = "В архиве найдены .uasset, это Unreal Engine content"
+    elif classification == "houdini_asset":
+        folder = find_best_existing_folder_by_keywords(
+            flat_paths=flat_paths,
+            preferred_tokens=["houdini", "hda", "asset", "assets", "tools"],
+            forbidden_tokens=["blender", "ue", "unreal", "unity"],
+        )
+        reason = "В архиве найдены Houdini Digital Assets (.hda)"
+    elif classification == "unity_package":
+        folder = find_best_existing_folder_by_keywords(
+            flat_paths=flat_paths,
+            preferred_tokens=["unity", "assets", "asset", "packages"],
+            forbidden_tokens=["blender", "ue", "unreal"],
+        )
+        reason = "В архиве найден .unitypackage"
+    elif classification == "adobe_extension":
+        folder = find_best_existing_folder_by_keywords(
+            flat_paths=flat_paths,
+            preferred_tokens=["adobe", "photoshop", "software", "plugin", "plugins"],
+            forbidden_tokens=["blender", "ue", "unreal", "unity"],
+        )
+        reason = "В архиве найдены Adobe/Photoshop extension файлы"
     else:
         return recs
 
@@ -1159,6 +1732,7 @@ def format_archive_for_prompt(archive_info: ArchiveInspection | None) -> str:
         f"  Signals           : {', '.join(signals) if signals else 'none'}\n"
         f"  Classification    : {classification}\n"
         f"  Classification why: {reason}\n"
+        f"  Use policy        : use as evidence after filename; hard manifests can override filename\n"
         f"  Sample entries:\n{entries}\n"
     )
 
@@ -1274,24 +1848,26 @@ def parse_llm_response(raw: str) -> dict | None:
     text = re.sub(r",\s*([\]}])", r"\1", text)
 
     decoder = json.JSONDecoder()
-    idx = 0
 
-    while idx < len(text):
-        brace_idx = text.find("{", idx)
+    for candidate in (text, repair_json_like_text(text)):
+        idx = 0
 
-        if brace_idx == -1:
-            break
+        while idx < len(candidate):
+            brace_idx = candidate.find("{", idx)
 
-        try:
-            obj, end = decoder.raw_decode(text[brace_idx:])
-        except json.JSONDecodeError:
-            idx = brace_idx + 1
-            continue
+            if brace_idx == -1:
+                break
 
-        if isinstance(obj, dict) and isinstance(obj.get("recommendations"), list):
-            return obj
+            try:
+                obj, end = decoder.raw_decode(candidate[brace_idx:])
+            except json.JSONDecodeError:
+                idx = brace_idx + 1
+                continue
 
-        idx = brace_idx + max(end, 1)
+            if isinstance(obj, dict) and isinstance(obj.get("recommendations"), list):
+                return obj
+
+            idx = brace_idx + max(end, 1)
 
     print(
         "  [ОШИБКА] В ответе LLM не найден валидный JSON-объект с ключом 'recommendations'."
@@ -1299,6 +1875,25 @@ def parse_llm_response(raw: str) -> dict | None:
     print(f"  [DEBUG RAW]:\n{text[:1000]}...\n")
 
     return None
+
+
+def repair_json_like_text(text: str) -> str:
+    """
+    Чинит частые мелкие ошибки локальных моделей в JSON:
+    - confidence: 0.4 -> "confidence": 0.4
+    - reason": "..." -> "reason": "..."
+    """
+    text = re.sub(
+        r"(?m)([{,]\s*)(folder|exists|confidence|reason|recommendations)\s*:",
+        r'\1"\2":',
+        text,
+    )
+    text = re.sub(
+        r"(?m)([{,]\s*)(folder|exists|confidence|reason|recommendations)\"\s*:",
+        r'\1"\2":',
+        text,
+    )
+    return text
 
 
 def validate_and_sort_recommendations(data: dict, flat_paths: list[str]) -> list[dict]:
@@ -1458,7 +2053,7 @@ def ask_llm(
 
 def ask_yes_no(prompt: str) -> bool:
     while True:
-        answer = input(prompt).strip().lower()
+        answer = read_input(prompt).strip().lower()
 
         if answer in ("y", "yes", "д", "да"):
             return True
@@ -1550,7 +2145,7 @@ def _confirm_delete(file_path: Path) -> bool:
 
 
 def _set_path(prompt_msg: str) -> Path | None:
-    path_str = input(prompt_msg).strip()
+    path_str = read_input(prompt_msg).strip()
 
     if not path_str:
         return None
@@ -1711,7 +2306,7 @@ def cmd_start() -> None:
                 if not current_paths:
                     print("  [!] Нет доступных папок для ручного выбора.")
                     choice = (
-                        input("  [-1] удалить, [s] пропустить, [q] выход: ")
+                        read_input("  [-1] удалить, [s] пропустить, [q] выход: ")
                         .strip()
                         .lower()
                     )
@@ -1731,7 +2326,7 @@ def cmd_start() -> None:
 
                 print_tree_numbered(current_paths)
                 choice = (
-                    input("  Номер папки, [-1] удалить, [s] пропустить, [q] выход: ")
+                    read_input("  Номер папки, [-1] удалить, [s] пропустить, [q] выход: ")
                     .strip()
                     .lower()
                 )
@@ -1766,9 +2361,26 @@ def cmd_start() -> None:
 
                 continue
 
+            display_recs, forced_timeout = prepare_recommendations_for_choice(recs)
+
+            if not display_recs:
+                show_full = True
+                continue
+
             print("\n  Рекомендации LLM:")
 
-            for i, r in enumerate(recs, 1):
+            if len(display_recs) < len(recs):
+                if forced_timeout is not None:
+                    print(
+                        "  [filter] Сильный отрыв лучшего варианта: "
+                        f"показываю только 1, таймер {forced_timeout} сек."
+                    )
+                else:
+                    print(
+                        f"  [filter] Скрыты варианты ниже {MIN_RECOMMENDATION_CONFIDENCE:.0%}."
+                    )
+
+            for i, r in enumerate(display_recs, 1):
                 filled = int(r["confidence"] * 10)
                 conf_bar = "█" * filled + "░" * (10 - filled)
                 status = "✓" if r["exists"] else "✚ новая"
@@ -1779,19 +2391,20 @@ def cmd_start() -> None:
                     f"        └─ {r['reason']}"
                 )
 
-            valid_choices = {str(i) for i in range(1, len(recs) + 1)}
+            valid_choices = {str(i) for i in range(1, len(display_recs) + 1)}
             valid_choices.update({"0", "-1", "s", "q"})
+            effective_timeout = forced_timeout or state.auto_select_seconds
 
-            if state.auto_select_seconds > 0 and not manual_mode_for_file:
+            if effective_timeout > 0 and not manual_mode_for_file:
                 prompt = (
-                    f"\n  Выбор [1-{len(recs)}], [0] другие, [-1] удалить, "
+                    f"\n  Выбор [1-{len(display_recs)}], [0] другие, [-1] удалить, "
                     f"[s] пропустить, [q] выход "
-                    f"(авто 1 через {state.auto_select_seconds} сек, Enter = ручной режим): "
+                    f"(авто 1 через {effective_timeout} сек, Enter = ручной режим): "
                 )
 
                 choice, timed_out = timed_choice(
                     prompt=prompt,
-                    timeout_seconds=state.auto_select_seconds,
+                    timeout_seconds=effective_timeout,
                     default="1",
                     valid_choices=valid_choices,
                 )
@@ -1801,8 +2414,8 @@ def cmd_start() -> None:
                 if choice == "__manual__":
                     manual_mode_for_file = True
                     choice = (
-                        input(
-                            f"  Ручной выбор [1-{len(recs)}], [0] другие, [-1] удалить, "
+                        read_input(
+                            f"  Ручной выбор [1-{len(display_recs)}], [0] другие, [-1] удалить, "
                             f"[s] пропустить, [q] выход: "
                         )
                         .strip()
@@ -1816,10 +2429,10 @@ def cmd_start() -> None:
                     print("  [auto] Таймаут. Выбрана рекомендация 1.")
             else:
                 prompt = (
-                    f"\n  Выбор [1-{len(recs)}], [0] другие, [-1] удалить, "
+                    f"\n  Выбор [1-{len(display_recs)}], [0] другие, [-1] удалить, "
                     f"[s] пропустить, [q] выход: "
                 )
-                choice = input(prompt).strip().lower()
+                choice = read_input(prompt).strip().lower()
                 timed_out = False
 
             if choice == "q":
@@ -1835,7 +2448,7 @@ def cmd_start() -> None:
                 continue
 
             if choice == "0":
-                for r in recs:
+                for r in display_recs:
                     folder = r["folder"]
                     if folder not in rejected_folders:
                         rejected_folders.append(folder)
@@ -1860,8 +2473,8 @@ def cmd_start() -> None:
                 show_full = True
                 continue
 
-            if choice.isdigit() and 1 <= int(choice) <= len(recs):
-                chosen = recs[int(choice) - 1]
+            if choice.isdigit() and 1 <= int(choice) <= len(display_recs):
+                chosen = display_recs[int(choice) - 1]
 
                 auto_confirm = bool(timed_out and AUTO_MOVE_WITHOUT_CONFIRMATION)
 
@@ -1881,6 +2494,71 @@ def cmd_start() -> None:
                 continue
 
             print("  [!] Некорректный ввод.")
+
+
+def cmd_duplicates() -> None:
+    if not state.root:
+        print("  [!] Установите источник командой: root")
+        return
+
+    if not state.root.is_dir():
+        print(f"  [!] root недоступен: {state.root}")
+        return
+
+    files = get_files_in_root(state.root)
+
+    if not files:
+        print("  [!] В root нет файлов для проверки.")
+        return
+
+    print(f"  [dup] Сканирую похожие имена в root: {state.root}")
+    groups = find_duplicate_groups(files)
+
+    if not groups:
+        print("  [✓] Похожих дублей или версий не найдено.")
+        return
+
+    print(f"  [dup] Найдено групп: {len(groups)}")
+    print("  Команды:")
+    print("    a         — применить предложенное удаление")
+    print(f"    k N       — оставить N, остальные переместить в {DUPLICATE_REVIEW_FOLDER}/")
+    print(f"    m N ...   — переместить выбранные в {DUPLICATE_REVIEW_FOLDER}/")
+    print("    d N ...   — удалить выбранные после подтверждения")
+    print("    s         — пропустить группу")
+    print("    q         — выйти")
+    print("  Предложение строится по правилам: версия → дата модификации → размер.")
+
+    processed = 0
+
+    for group_index, original_group in enumerate(groups, 1):
+        group = [file_path for file_path in original_group if file_path.exists()]
+
+        if len(group) < 2:
+            continue
+
+        while True:
+            group = [file_path for file_path in group if file_path.exists()]
+
+            if len(group) < 2:
+                break
+
+            print_duplicate_group(group, group_index, len(groups))
+            choice = read_input("\n  duplicates> ").strip().lower()
+            status, processed_delta = apply_duplicate_command(
+                choice,
+                group,
+                state.root,
+            )
+            processed += processed_delta
+
+            if status == "quit":
+                print(f"  [dup] Обработано групп: {processed}")
+                return
+
+            if status == "done":
+                break
+
+    print(f"\n  [✓] Проверка дублей завершена. Обработано групп: {processed}")
 
 
 def cmd_status() -> None:
@@ -1917,6 +2595,7 @@ def cmd_help() -> None:
         f"  clear_dest  — очистить dest, назначение будет равно root\n"
         f"  folders     — вручную пересканировать папки в dest/root\n"
         f"  start       — начать сортировку, папки сканируются автоматически\n"
+        f"  duplicates  — найти похожие файлы/версии в root\n"
         f"  timeout N   — изменить таймаут автовыбора, 0 = отключить\n"
         f"  status      — статус\n"
         f"  help        — помощь\n"
@@ -1931,6 +2610,7 @@ COMMANDS = {
     "clear_dest": cmd_clear_dest,
     "folders": cmd_folders,
     "start": cmd_start,
+    "duplicates": cmd_duplicates,
     "status": cmd_status,
     "help": cmd_help,
 }
@@ -1955,7 +2635,7 @@ def main() -> None:
 
     while True:
         try:
-            line = input("\n> ").strip()
+            line = read_input("\n> ").strip()
 
             if not line:
                 continue
