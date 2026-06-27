@@ -24,11 +24,45 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Set, Optional, Tuple, Dict
 
+
+def _ensure_project_venv() -> None:
+    """Restart the script with the project .venv interpreter when needed."""
+    if getattr(sys, "frozen", False) or os.environ.get("RFR_VENV_ACTIVE") == "1":
+        return
+
+    project_dir = pathlib.Path(__file__).resolve().parent
+    scripts_dir = "Scripts" if os.name == "nt" else "bin"
+    python_name = "python.exe" if os.name == "nt" else "python"
+    venv_dir = project_dir / ".venv"
+    venv_python = venv_dir / scripts_dir / python_name
+
+    try:
+        current_python = pathlib.Path(sys.executable).resolve()
+        target_python = venv_python.resolve(strict=False)
+    except OSError:
+        return
+
+    if current_python == target_python:
+        os.environ["RFR_VENV_ACTIVE"] = "1"
+        return
+
+    if not venv_python.exists():
+        subprocess.check_call([sys.executable, "-m", "venv", str(venv_dir)])
+
+    env = os.environ.copy()
+    env["RFR_VENV_ACTIVE"] = "1"
+    os.execve(str(venv_python), [str(venv_python), *sys.argv], env)
+
+
+_ensure_project_venv()
+
 try:
     from dotenv import load_dotenv, set_key
 except ModuleNotFoundError as exc:
-    sys.stderr.write("pip install python-dotenv\n")
-    raise exc
+    if exc.name != "dotenv":
+        raise
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "python-dotenv"])
+    from dotenv import load_dotenv, set_key
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -1380,6 +1414,14 @@ class App(tk.Tk):
         # Apply selection mask
         files_to_process = [f for f in files_to_process if f in self.selected_files]
 
+        if not files_to_process:
+            messagebox.showwarning(
+                "Warning",
+                "No files selected or no files match the current filter.",
+            )
+            self._reset_ui()
+            return
+
         asyncio.run_coroutine_threadsafe(
             self._run_generation(
                 s.source, s.extensions, s.exclude, s.output, limits, files_to_process
@@ -1388,7 +1430,7 @@ class App(tk.Tk):
         )
 
     async def _run_generation(
-            self, root, exts, excludes, out_name, limits, files_to_process=None
+        self, root, exts, excludes, out_name, limits, files_to_process=None
     ):
         if files_to_process is None:
             files_to_process = self.available_files
@@ -1400,7 +1442,7 @@ class App(tk.Tk):
             LOGGER.exception("Generation error")
             self.after(
                 0,
-                lambda: [
+                lambda exc=exc: [
                     messagebox.showerror("Error", f"Failed:\n{exc}"),
                     self._reset_ui(),
                 ],

@@ -22,6 +22,7 @@ import tempfile
 from difflib import SequenceMatcher
 from pathlib import Path
 from dataclasses import dataclass, field
+from send2trash import send2trash
 
 # ─────────────────────────────────────────────
 #  Конфигурация
@@ -63,8 +64,14 @@ AUTO_MOVE_WITHOUT_CONFIRMATION = True
 # Небольшой запас на случай, если пользователь нажал клавишу ровно на границе таймаута.
 TIMEOUT_INPUT_GRACE_SECONDS = 1.0
 
-SCRIPT_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+SCRIPT_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+)
 CONFIG_PATH = SCRIPT_DIR / "file_sorter_assistant.ini"
+LLM_DUPLICATE_LOG_DIR = SCRIPT_DIR / "llm_duplicate_logs"
+LLM_DUPLICATE_DEBUG_LOG: Path | None = None
 
 
 # ─────────────────────────────────────────────
@@ -114,6 +121,15 @@ class ArchiveEntryDetail:
     path: str
     size: int | None = None
     modified: str = ""
+
+
+@dataclass(frozen=True)
+class ArchiveStructureSignature:
+    classification: str | None
+    roots: frozenset[str]
+    key_names: frozenset[str]
+    suffixes: frozenset[str]
+    entry_count: int
 
 
 # ─────────────────────────────────────────────
@@ -243,6 +259,80 @@ def save_config() -> None:
 # ─────────────────────────────────────────────
 #  Дерево папок
 # ─────────────────────────────────────────────
+
+
+def json_log_safe(value):
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, dict):
+        return {str(key): json_log_safe(item) for key, item in value.items()}
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [json_log_safe(item) for item in value]
+
+    return value
+
+
+def llm_duplicate_log(event: str, **payload) -> None:
+    if not LLM_DUPLICATE_DEBUG_LOG:
+        return
+
+    record = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event": event,
+        **payload,
+    }
+
+    try:
+        with LLM_DUPLICATE_DEBUG_LOG.open("a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(json_log_safe(record), ensure_ascii=False, default=str))
+            log_file.write("\n")
+    except OSError as e:
+        print(f"  [dup-llm-log] Не удалось записать лог: {e}")
+
+
+def start_llm_duplicate_log(root: Path, files: list[Path]) -> Path | None:
+    global LLM_DUPLICATE_DEBUG_LOG
+
+    try:
+        LLM_DUPLICATE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        LLM_DUPLICATE_DEBUG_LOG = LLM_DUPLICATE_LOG_DIR / f"duplicates-llm-{timestamp}.jsonl"
+        llm_duplicate_log(
+            "session_start",
+            root=root,
+            file_count=len(files),
+            files=[str(file_path) for file_path in files],
+            model=MODEL_NAME,
+            url=LLAMACPP_URL,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+        )
+        return LLM_DUPLICATE_DEBUG_LOG
+    except OSError as e:
+        LLM_DUPLICATE_DEBUG_LOG = None
+        print(f"  [dup-llm-log] Не удалось создать лог: {e}")
+        return None
+
+
+def parse_llm_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+
+        if lowered in {"false", "0", "no", "n", ""}:
+            return False
+
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    return False
 
 
 def build_tree(base_dir: Path, max_depth: int = MAX_DEPTH) -> tuple[str, list[str]]:
@@ -1511,6 +1601,9 @@ VERSION_PATTERNS = (
 VERSION_EXTRACT_RE = re.compile(
     r"(?i)(?:^|[^a-z0-9])(?:v|ver(?:sion)?[._ -]*)?(\d+(?:[._-]\d+){0,5}[a-z]?)(?=$|[^a-z0-9])"
 )
+EXPLICIT_VERSION_EXTRACT_RE = re.compile(
+    r"(?i)(?:^|[^a-z0-9])(?:v|ver(?:sion)?[._ -]*)(\d+(?:[._-]\d+){0,5}[a-z]?)(?=$|[^a-z0-9])"
+)
 
 COMPACT_VERSION_RE = re.compile(r"(?i)(?<=[a-z])(\d{3})(?:[a-z]*)$")
 COMPACT_DROP_WORDS = (
@@ -1620,6 +1713,28 @@ def compact_duplicate_skeleton(compact: str) -> str:
     return re.sub(r"[aeiouy]+", "", compact)
 
 
+def duplicate_containment_is_weak(
+    left_key: str,
+    right_key: str,
+    left_compact: str,
+    right_compact: str,
+) -> bool:
+    if left_compact == right_compact:
+        return False
+
+    if len(left_compact) <= len(right_compact):
+        shorter_key = left_key
+        longer_key = right_key
+    else:
+        shorter_key = right_key
+        longer_key = left_key
+
+    shorter_tokens = shorter_key.split()
+    longer_tokens = longer_key.split()
+
+    return len(shorter_tokens) == 1 and len(longer_tokens) > 1
+
+
 def duplicate_files_look_related(left: Path, right: Path) -> bool:
     left_key = normalize_duplicate_key(left)
     right_key = normalize_duplicate_key(right)
@@ -1637,6 +1752,7 @@ def duplicate_files_look_related(left: Path, right: Path) -> bool:
 
     if (
         shorter_compact not in DUPLICATE_GENERIC_NAME_TOKENS
+        and not duplicate_containment_is_weak(left_key, right_key, left_compact, right_compact)
         and (left_compact in right_compact or right_compact in left_compact)
     ):
         return True
@@ -1654,11 +1770,248 @@ def duplicate_files_look_related(left: Path, right: Path) -> bool:
 
     if (
         shorter_skeleton not in DUPLICATE_GENERIC_NAME_TOKENS
+        and not duplicate_containment_is_weak(left_key, right_key, left_compact, right_compact)
         and (left_skeleton in right_skeleton or right_skeleton in left_skeleton)
     ):
         return True
 
     return SequenceMatcher(None, left_skeleton, right_skeleton).ratio() >= 0.86
+
+
+def archive_structure_token(value: str) -> str:
+    spaced = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", value)
+    name = remove_known_suffix(Path(spaced).name).lower()
+    name = VERSION_EXTRACT_RE.sub(" ", name)
+
+    for pattern in VERSION_PATTERNS:
+        name = re.sub(pattern, " ", name, flags=re.IGNORECASE)
+
+    return re.sub(r"[^a-z0-9]+", "", name)
+
+
+def archive_structure_signature(
+    file_path: Path,
+    cache: dict[Path, ArchiveStructureSignature | None],
+) -> ArchiveStructureSignature | None:
+    if file_path in cache:
+        return cache[file_path]
+
+    if not archive_suffix(file_path):
+        cache[file_path] = None
+        return None
+
+    try:
+        entry_details, _total_entries, _truncated = read_archive_entry_details(file_path)
+    except Exception:
+        cache[file_path] = None
+        return None
+
+    entries = [entry.path for entry in entry_details]
+
+    if not entries:
+        cache[file_path] = None
+        return None
+
+    classification, _reason = classify_archive_entries(entries)
+    roots: set[str] = set()
+    key_names: set[str] = set()
+    suffixes: set[str] = set()
+
+    for entry in entries:
+        parts = entry.split("/")
+        root_source = parts[0] if len(parts) > 1 else Path(parts[0]).stem
+        root = archive_structure_token(root_source)
+
+        if root:
+            roots.add(root)
+
+        detail = ArchiveEntryDetail(path=entry)
+        name = archive_structure_token(Path(entry).name)
+        suffix = Path(entry).suffix.lower()
+
+        if suffix:
+            suffixes.add(suffix)
+
+        if name and archive_detail_key_file(detail):
+            key_names.add(name)
+
+    signature = ArchiveStructureSignature(
+        classification=classification,
+        roots=frozenset(roots),
+        key_names=frozenset(key_names),
+        suffixes=frozenset(suffixes),
+        entry_count=len(entries),
+    )
+    cache[file_path] = signature
+    return signature
+
+
+def archive_signatures_look_related(
+    left: ArchiveStructureSignature,
+    right: ArchiveStructureSignature,
+) -> bool:
+    if left.classification and right.classification and left.classification != right.classification:
+        return False
+
+    if left.roots & right.roots:
+        return True
+
+    if left.key_names & right.key_names:
+        return True
+
+    for left_root in left.roots:
+        for right_root in right.roots:
+            if SequenceMatcher(None, left_root, right_root).ratio() >= DUPLICATE_SIMILARITY_THRESHOLD:
+                return True
+
+    for left_name in left.key_names:
+        for right_name in right.key_names:
+            if SequenceMatcher(None, left_name, right_name).ratio() >= DUPLICATE_SIMILARITY_THRESHOLD:
+                return True
+
+    if not left.roots and not right.roots and not left.key_names and not right.key_names:
+        return bool(left.suffixes & right.suffixes)
+
+    return False
+
+
+def archive_structure_allows_auto_add(
+    candidate_path: Path,
+    group_paths: list[Path],
+    cache: dict[Path, ArchiveStructureSignature | None],
+) -> bool:
+    if not archive_suffix(candidate_path):
+        return True
+
+    candidate_signature = archive_structure_signature(candidate_path, cache)
+
+    if candidate_signature is None:
+        return True
+
+    group_archive_signatures = [
+        signature
+        for path in group_paths
+        if archive_suffix(path)
+        for signature in [archive_structure_signature(path, cache)]
+        if signature is not None
+    ]
+
+    if not group_archive_signatures:
+        return True
+
+    return any(
+        archive_signatures_look_related(candidate_signature, signature)
+        for signature in group_archive_signatures
+    )
+
+
+def archive_structure_components(
+    archive_ids: list[int],
+    id_to_path: dict[int, Path],
+    cache: dict[Path, ArchiveStructureSignature | None],
+) -> list[set[int]]:
+    signatures = {
+        file_id: signature
+        for file_id in archive_ids
+        for signature in [archive_structure_signature(id_to_path[file_id], cache)]
+        if signature is not None
+    }
+    components: list[set[int]] = []
+
+    for file_id in signatures:
+        matching_indexes = [
+            index
+            for index, component in enumerate(components)
+            if any(
+                archive_signatures_look_related(signatures[file_id], signatures[member_id])
+                for member_id in component
+            )
+        ]
+
+        if not matching_indexes:
+            components.append({file_id})
+            continue
+
+        first_index = matching_indexes[0]
+        components[first_index].add(file_id)
+
+        for index in reversed(matching_indexes[1:]):
+            components[first_index].update(components[index])
+            del components[index]
+
+    return components
+
+
+def split_llm_duplicate_groups_by_archive_structure(
+    groups: list[dict],
+    id_to_path: dict[int, Path],
+) -> list[dict]:
+    split_groups: list[dict] = []
+    archive_signature_cache: dict[Path, ArchiveStructureSignature | None] = {}
+
+    for group in groups:
+        candidate_ids = sorted(group_file_ids(group))
+        archive_ids = [
+            file_id
+            for file_id in candidate_ids
+            if file_id in id_to_path and archive_suffix(id_to_path[file_id])
+        ]
+
+        if len(archive_ids) < 2:
+            split_groups.append(group)
+            continue
+
+        components = archive_structure_components(archive_ids, id_to_path, archive_signature_cache)
+        multi_components = [component for component in components if len(component) >= 2]
+        llm_duplicate_log(
+            "archive_structure_components",
+            group=group,
+            archive_ids=archive_ids,
+            components=[sorted(component) for component in components],
+        )
+
+        if len(components) <= 1:
+            split_groups.append(group)
+            continue
+
+        if not multi_components:
+            continue
+
+        for component in multi_components:
+            keep_id = group["keep"] if group["keep"] in component else max(
+                component,
+                key=lambda file_id: duplicate_file_score(id_to_path[file_id]),
+            )
+            delete_ids = sorted(file_id for file_id in component if file_id != keep_id)
+
+            if not delete_ids:
+                continue
+
+            removed_ids = sorted(set(candidate_ids) - component)
+            llm_duplicate_log(
+                "archive_structure_pruned_group",
+                original_group=group,
+                kept_component=sorted(component),
+                removed_ids=removed_ids,
+            )
+            removed_text = (
+                "; исключены по структуре архива: "
+                + ", ".join(f"[{file_id}] {id_to_path[file_id].name}" for file_id in removed_ids)
+                if removed_ids
+                else ""
+            )
+
+            split_groups.append(
+                {
+                    **group,
+                    "keep": keep_id,
+                    "delete": delete_ids,
+                    "structure_pruned_ids": removed_ids,
+                    "reason": f"{group['reason']}{removed_text}",
+                }
+            )
+
+    return split_groups
 
 
 def compact_version_tuple(name: str) -> tuple[int, ...] | None:
@@ -1685,7 +2038,8 @@ def normalize_version_tuple(version: tuple[int, ...] | None) -> tuple[int, ...]:
 
 def duplicate_version_tuple(file_path: Path) -> tuple[int, ...] | None:
     name = remove_known_suffix(file_path.name).lower()
-    matches = list(VERSION_EXTRACT_RE.finditer(name))
+    explicit_matches = list(EXPLICIT_VERSION_EXTRACT_RE.finditer(name))
+    matches = explicit_matches or list(VERSION_EXTRACT_RE.finditer(name))
 
     best: tuple[int, ...] | None = None
 
@@ -1910,7 +2264,7 @@ def move_duplicate_files(root: Path, files: list[Path]) -> int:
     return moved
 
 
-def delete_duplicate_files(files: list[Path]) -> int:
+def _legacy_delete_duplicate_files_unused(files: list[Path], root: Path | None = None) -> int:
     deleted = 0
 
     for file_path in files:
@@ -1918,11 +2272,34 @@ def delete_duplicate_files(files: list[Path]) -> int:
             continue
 
         try:
-            file_path.unlink()
+            send2trash(str(file_path))
             print(f"  [✓] Удалено: {file_path.name}")
             deleted += 1
-        except OSError as e:
+        except Exception as e:
             print(f"  [ОШИБКА] {file_path.name}: {e}")
+
+    return deleted
+
+
+def delete_duplicate_files(files: list[Path], root: Path | None = None) -> int:
+    deleted = 0
+
+    for file_path in files:
+        if not file_path.exists():
+            continue
+
+        try:
+            send2trash(str(file_path))
+            print(f"  [ok] В корзину: {file_path.name}")
+            deleted += 1
+        except Exception as e:
+            print(f"  [!] Не удалось отправить в корзину: {file_path.name}: {e}")
+
+            if root:
+                print(f"  [dup] Перемещаю в {DUPLICATE_REVIEW_FOLDER}/ вместо безвозвратного удаления.")
+                deleted += move_duplicate_files(root, [file_path])
+            else:
+                print("  [dup] Файл оставлен на месте.")
 
     return deleted
 
@@ -2229,33 +2606,47 @@ Rules:
 4. Treat trailing zero version parts as equal: 2.2.6.0 equals 2.2.6. Use comparable_version for that comparison.
 5. Use filename, size, modified date, extension group, normalized key, detected_version, comparable_version, spelling variants, and abbreviations.
 6. Include all visible versions of the same product family in one group; do not ignore a newer version candidate.
-7. Priority for keep/delete: newest comparable_version first; if versions are equal or absent, newer modified date; if modified date is the same day, larger size.
-8. Never keep an older version only because its archive contents look larger, fuller, or more reliable. If the newer file is a different product, omit the group instead.
-9. A typo, abbreviation, or compact spelling in the filename does not make a newer version worse by itself.
-10. Compare file size only by the numeric size_bytes field. Do not claim a file is smaller/larger unless size_bytes proves it.
-11. Multipart archives like part1/part2 are usually a set, not duplicates. Do not mark one part for deletion unless the same part is duplicated.
-12. A plugin/addon/preset for an application is not a duplicate of the host application itself.
-13. Broad candidate hints are only hints. You may split a hint into smaller groups.
-14. Hints with source=local_similarity are strong review candidates. Return them as groups unless they are clearly different products.
-15. For every broad candidate hint: either return a group, or add a rejected_hints item with a concrete reason.
-16. If files look like the same product line but you are not fully sure, return a lower-confidence group instead of rejecting it.
-17. Never suggest deleting all files in a group.
-18. Return at most {LLM_DUPLICATE_MAX_GROUPS} groups.
-19. "delete" contains file IDs that are candidates for manual deletion. No action will be automatic.
-20. In reason, mention the version/name comparison you used.
+7. Priority for keep/delete: newest product version first; if product versions are equal or absent, newer modified date; if modified date is the same day, larger size.
+8. You are responsible for product-version reasoning. Treat detected_version/comparable_version as weak hints only.
+9. Do not confuse engine/platform compatibility with product version. Examples: UE54, UE5.4, Unreal 5.4, Blender 4.2, Win64, Android are compatibility targets, not necessarily the product version. Prefer explicit product markers like v1.77, version 1.77, plugin changelog/version files, or consistent product naming.
+10. Never keep an older product version only because its archive contents look larger, fuller, or more reliable. If the newer file is a different product, omit the group instead.
+11. A typo, abbreviation, or compact spelling in the filename does not make a newer version worse by itself.
+12. Compare file size only by the numeric size_bytes field. Do not claim a file is smaller/larger unless size_bytes proves it.
+13. Multipart archives like part1/part2 are usually a set, not duplicates. Do not mark one part for deletion unless the same part is duplicated.
+14. A plugin/addon/preset for an application is not a duplicate of the host application itself.
+15. A category archive, partial download, extracted subpack, optional component, demo fragment, platform-specific build, or thematic slice from a larger package is not a duplicate by default. Reject or omit it unless evidence clearly shows the smaller archive is redundant and fully covered by the larger archive.
+16. Broad candidate hints are only hints. You may split a hint into smaller groups.
+17. Hints with source=local_similarity are strong review candidates. Return them as groups unless they are clearly different products or likely standalone components/fragments.
+18. For every broad candidate hint: either return a group, or add a rejected_hints item with a concrete reason.
+19. If files look like the same product line but you are not fully sure, return a lower-confidence group instead of rejecting it.
+20. Never suggest deleting all files in a group.
+21. Return at most {LLM_DUPLICATE_MAX_GROUPS} groups.
+22. "delete" contains file IDs that are candidates for manual deletion. No action will be automatic.
+23. In reason, mention the product-version/name comparison you used.
 """
+
+    user_prompt = f"Files:\n{prompt}\n\nBroad candidate hints:\n{hints}"
+    llm_duplicate_log(
+        "initial_llm_request",
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        hint_count=hint_count,
+    )
 
     raw = call_llm_raw(
         [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Files:\n{prompt}\n\nBroad candidate hints:\n{hints}"},
+            {"role": "user", "content": user_prompt},
         ]
     )
+
+    llm_duplicate_log("initial_llm_raw_response", raw=raw)
 
     if not raw:
         return [], id_to_path, []
 
     data = parse_json_object_response(raw)
+    llm_duplicate_log("initial_llm_parsed_json", data=data)
 
     if not data:
         print("  [ОШИБКА] LLM не вернула JSON с groups.")
@@ -2314,7 +2705,8 @@ Rules:
                 "confidence": confidence,
                 "keep": keep_id,
                 "delete": delete_ids,
-                "structure_override": bool(raw_group.get("structure_override", False)),
+                "structure_override": parse_llm_bool(raw_group.get("structure_override", False)),
+                "raw_structure_override": raw_group.get("structure_override", False),
                 "analysis": str(raw_group.get("analysis", "")).replace('"', "'").strip(),
                 "reason": str(raw_group.get("reason", "")).replace('"', "'").strip(),
             }
@@ -2323,6 +2715,7 @@ Rules:
         if len(groups) >= LLM_DUPLICATE_MAX_GROUPS:
             break
 
+    llm_duplicate_log("initial_llm_validated_groups", groups=groups, rejected_hints=rejected_hints)
     return groups, id_to_path, rejected_hints
 
 
@@ -2417,7 +2810,8 @@ def validate_llm_duplicate_groups(data: dict, id_to_path: dict[int, Path]) -> li
                 "confidence": confidence,
                 "keep": keep_id,
                 "delete": delete_ids,
-                "structure_override": bool(raw_group.get("structure_override", False)),
+                "structure_override": parse_llm_bool(raw_group.get("structure_override", False)),
+                "raw_structure_override": raw_group.get("structure_override", False),
                 "analysis": str(raw_group.get("analysis", "")).replace('"', "'").strip(),
                 "reason": str(raw_group.get("reason", "")).replace('"', "'").strip(),
             }
@@ -2432,13 +2826,18 @@ def validate_llm_duplicate_groups(data: dict, id_to_path: dict[int, Path]) -> li
 def expand_llm_duplicate_groups(groups: list[dict], id_to_path: dict[int, Path]) -> list[dict]:
     expanded: list[dict] = []
     consumed_delete_ids: set[int] = set()
+    archive_signature_cache: dict[Path, ArchiveStructureSignature | None] = {}
 
     for group in groups:
         group_ids = [group["keep"], *group["delete"]]
         related_ids = set(group_ids)
+        group_paths = [id_to_path[group_id] for group_id in group_ids if group_id in id_to_path]
 
         for file_id, file_path in id_to_path.items():
             if file_id in related_ids:
+                continue
+
+            if not archive_structure_allows_auto_add(file_path, group_paths, archive_signature_cache):
                 continue
 
             if any(duplicate_files_look_related(file_path, id_to_path[group_id]) for group_id in group_ids):
@@ -2451,7 +2850,10 @@ def expand_llm_duplicate_groups(groups: list[dict], id_to_path: dict[int, Path])
             continue
 
         candidates = sorted(related_ids)
-        keep_id = max(candidates, key=lambda file_id: duplicate_file_score(id_to_path[file_id]))
+        keep_id = group["keep"] if group["keep"] in related_ids else max(
+            candidates,
+            key=lambda file_id: duplicate_file_score(id_to_path[file_id]),
+        )
         delete_ids = [
             file_id
             for file_id in candidates
@@ -2535,9 +2937,8 @@ def enforce_llm_duplicate_priority(
         if group_contains_multipart_set_parts(sorted(candidate_ids), id_to_path):
             continue
 
-        structure_override = bool(group.get("structure_override", False))
         old_keep = group["keep"]
-        keep_id = old_keep if structure_override and old_keep in candidate_ids else max(
+        keep_id = old_keep if old_keep in candidate_ids else max(
             candidate_ids,
             key=lambda file_id: duplicate_file_score(id_to_path[file_id]),
         )
@@ -2556,7 +2957,7 @@ def enforce_llm_duplicate_priority(
         used_delete_ids.update(delete_ids)
         reason = group["reason"]
 
-        if structure_override:
+        if group.get("structure_override", False):
             reason = (
                 f"{reason}; выбор LLM оставлен по deep-анализу структуры архива "
                 f"(structure_override=true)"
@@ -2706,10 +3107,11 @@ Rules:
 2. If archive contents clearly differ in product type, ecosystem, or main files, omit that group.
 3. Use archive sample entries to compare internal structure and main file types.
 4. fallback_added_ids are only weak local candidates; confirm or reject them yourself.
-5. Extract and compare versions yourself from filenames. Version patterns can be diverse: v1.2.6, 126 meaning 1.2.6 for compact product names, 2025.3.3, 20.0.5.17637, R25, beta/build/release suffixes.
-6. Treat trailing zero version parts as equal: 2.2.6.0 equals 2.2.6. Use comparable_version for that comparison.
+5. Extract and compare product versions yourself from filenames and archive contents. Version patterns can be diverse: v1.2.6, 126 meaning 1.2.6 for compact product names, 2025.3.3, 20.0.5.17637, R25, beta/build/release suffixes.
+6. Treat trailing zero version parts as equal: 2.2.6.0 equals 2.2.6. Treat comparable_version as a weak script hint, not a command.
+6a. Do not confuse engine/platform compatibility with product version. Examples: UE54, UE5.4, Unreal 5.4, Blender 4.2, Win64, Android are compatibility targets, not necessarily the product version. Prefer explicit product markers like v1.77, version 1.77, plugin changelog/version files, or consistent product naming.
 7. Include all visible versions of the same product family in one group; do not ignore a newer version candidate.
-8. Baseline priority for keep/delete: newest comparable_version first; if versions are equal or absent, newer modified date; if modified date is the same day, larger size.
+8. Baseline priority for keep/delete: newest product version first; if product versions are equal or absent, newer modified date; if modified date is the same day, larger size.
 9. Deep archive structure can override the baseline when it proves the baseline winner only has redundant junk, duplicate copies, download-site files, cache/backup files, or renamed duplicate content.
 10. A typo, abbreviation, or compact spelling in the filename does not make a newer version worse by itself.
 11. Archive structure reports are evidence from archive catalogs; do not call a file "full" or "only installer" unless the listed entries clearly prove it.
@@ -2717,50 +3119,66 @@ Rules:
 13. Multipart archives like part1/part2 are usually a set, not duplicates. Do not mark one part for deletion unless the same part is duplicated.
 14. A plugin/addon/preset for an application is not a duplicate of the host application itself.
 15. If a report contains nested_archives, treat their nested contents as part of that candidate. Do not call an outer archive empty/broken just because the useful files are inside a nested archive.
-16. Treat the Strict local rule report as a baseline recommendation, not a command. You may override strict_keep if detailed archive structure proves another file is cleaner or equivalent.
-17. If one archive is a superset of another, decide whether the extra files are valuable main content or removable noise. Common noise examples: duplicate filenames with suffixes like copy/backup/old/blend1, CGDownload/html/url/readme ads, metadata, cache, temp files, thumbnails.
-18. If core content is identical and the only meaningful difference is redundant/noise files, prefer the cleaner archive even if it is smaller or older.
-19. If extra files are real assets, source files, presets, textures, examples, or newer main content, prefer the fuller archive.
-20. If internal evidence is insufficient to tell whether extra files are noise or valuable content, keep the baseline winner but state uncertainty.
-21. Set structure_override=true only when archive structure evidence is strong enough to override the baseline version/date/size winner.
-22. Never suggest deleting all files in a group.
-23. No action will be automatic; user will confirm manually.
-24. Return at most {LLM_DUPLICATE_MAX_GROUPS} groups.
-25. Fill "analysis" with a careful Russian comparison: external filenames, versions, archive file counts, internal key files, nested archive contents, internal sizes/dates, common paths, unique paths, whether extras look useful or redundant/noise, and uncertainty.
-26. In reason, give the short final recommendation.
+16. Treat the local rule report as a weak script heuristic only. It may confuse product versions with engine/platform compatibility. You are expected to override strict_keep whenever your product-version or archive-content analysis disagrees.
+17. A category archive, partial download, extracted subpack, optional component, demo fragment, platform-specific build, or thematic slice from a larger package is not a duplicate by default. Omit the group unless the smaller archive is clearly redundant and fully covered by the larger archive.
+18. If one archive appears to be a superset of another, only recommend deleting the smaller one when the listed internal paths prove that the smaller archive's meaningful files are already present in the larger archive with the same paths or equivalent clear names. If evidence is partial or based only on size/file count, omit the group.
+19. If core content is identical and the only meaningful difference is redundant/noise files, prefer the cleaner archive even if it is smaller or older.
+20. If extra files are real assets, source files, presets, textures, examples, optional components, platform/engine-specific builds, or newer main content, prefer keeping both or omit the group.
+21. If internal evidence is insufficient to tell whether extra files are noise, valuable content, or a standalone component, omit the group rather than recommending deletion.
+22. Set structure_override=true only when archive structure evidence is strong enough to override the baseline version/date/size winner.
+23. Never suggest deleting all files in a group.
+24. No action will be automatic; user will confirm manually.
+25. Return at most {LLM_DUPLICATE_MAX_GROUPS} groups.
+26. Fill "analysis" with a careful Russian comparison: external filenames, versions, archive file counts, internal key files, nested archive contents, internal sizes/dates, common paths, unique paths, whether extras look useful, redundant/noise, or a standalone component, and uncertainty.
+27. In reason, give the short final recommendation.
 """
+
+    user_content = (
+        f"Original candidate groups:\n{original_groups}\n\n"
+        f"Candidate file details:\n{candidate_details}\n\n"
+        f"Weak local heuristic report (may be wrong about product versions):\n{rule_report}\n\n"
+        f"Detailed archive structure reports:\n{archive_details}"
+    )
+    llm_duplicate_log(
+        "archive_refine_llm_request",
+        system_prompt=system_prompt,
+        user_prompt=user_content,
+        archive_ids=archive_ids,
+        original_groups=groups,
+        candidate_details=candidate_details,
+        rule_report=rule_report,
+        archive_details=archive_details,
+    )
 
     raw = call_llm_raw(
         [
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": (
-                    f"Original candidate groups:\n{original_groups}\n\n"
-                    f"Candidate file details:\n{candidate_details}\n\n"
-                    f"Baseline local rule report:\n{rule_report}\n\n"
-                    f"Detailed archive structure reports:\n{archive_details}"
-                ),
-            },
+            {"role": "user", "content": user_content},
         ]
     )
+
+    llm_duplicate_log("archive_refine_llm_raw_response", raw=raw)
 
     if not raw:
         return groups
 
     data = parse_json_object_response(raw)
+    llm_duplicate_log("archive_refine_llm_parsed_json", data=data)
 
     if not data:
         print("  [LLM] Не удалось уточнить группы по содержимому архивов. Использую первичный список.")
         return groups
 
     refined = validate_llm_duplicate_groups(data, id_to_path)
+    llm_duplicate_log("archive_refine_validated_groups", groups=refined)
 
     if not refined:
         print("  [LLM] После проверки архивов подходящих дублей не осталось.")
         return []
 
-    return enforce_llm_duplicate_priority(refined, groups, id_to_path)
+    fixed = enforce_llm_duplicate_priority(refined, groups, id_to_path)
+    llm_duplicate_log("archive_refine_priority_enforced_groups", groups=fixed)
+    return fixed
 
 
 def print_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], index: int, total: int) -> None:
@@ -2921,8 +3339,8 @@ def apply_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], root: Pa
             for file_path in delete_files:
                 print(f"    - {file_path.name}")
 
-            if ask_yes_no("  Удалить предложенные LLM файлы безвозвратно? [y/n]: "):
-                deleted = delete_duplicate_files(delete_files)
+            if ask_yes_no("  Отправить предложенные LLM файлы в корзину? [y/n]: "):
+                deleted = delete_duplicate_files(delete_files, root)
                 return ("done", 1) if deleted else ("done", 0)
 
             continue
@@ -3013,8 +3431,8 @@ def apply_duplicate_command(
         for file_path in selected:
             print(f"    - {file_path.name}")
 
-        if ask_yes_no("  Удалить выбранные файлы безвозвратно? [y/n]: "):
-            deleted = delete_duplicate_files(selected)
+        if ask_yes_no("  Отправить выбранные файлы в корзину? [y/n]: "):
+            deleted = delete_duplicate_files(selected, root)
             return ("done", 1) if deleted else ("continue", 0)
 
         return "continue", 0
@@ -3993,7 +4411,7 @@ def move_file(
 def _confirm_delete(file_path: Path) -> bool:
     if ask_yes_no(f"  Точно удалить '{file_path.name}'? [y/n]: "):
         try:
-            file_path.unlink()
+            send2trash(str(file_path))
             print("  [✓] Удален.")
             return True
         except OSError as e:
@@ -4446,8 +4864,14 @@ def cmd_duplicates_llm() -> None:
         )
         files = files[:LLM_DUPLICATE_MAX_FILES]
 
+    log_path = start_llm_duplicate_log(state.root, files)
+
+    if log_path:
+        print(f"  [dup-llm-log] Лог анализа: {log_path}")
+
     print(f"  [dup-llm] Отправляю LLM список файлов: {len(files)}")
     groups, id_to_path, rejected_hints = ask_llm_duplicate_groups(files)
+    llm_duplicate_log("after_initial_llm", groups=groups, rejected_hints=rejected_hints)
 
     if not groups:
         print("  [✓] LLM не нашла уверенных кандидатов на дубли.")
@@ -4455,13 +4879,23 @@ def cmd_duplicates_llm() -> None:
         return
 
     groups = expand_llm_duplicate_groups(groups, id_to_path)
+    llm_duplicate_log("after_local_expand", groups=groups)
 
     if not groups:
         print("  [✓] После расширения похожих имён дубли не подтверждены.")
         print_rejected_duplicate_hints(rejected_hints, id_to_path)
         return
 
+    groups = split_llm_duplicate_groups_by_archive_structure(groups, id_to_path)
+    llm_duplicate_log("after_archive_structure_split", groups=groups)
+
+    if not groups:
+        print("  [✓] После сравнения структуры архивов дубли не подтверждены.")
+        print_rejected_duplicate_hints(rejected_hints, id_to_path)
+        return
+
     groups = refine_llm_duplicate_groups_with_archives(groups, id_to_path)
+    llm_duplicate_log("after_archive_refine", groups=groups)
 
     if not groups:
         print("  [✓] После проверки содержимого архивов дубли не подтверждены.")
@@ -4490,8 +4924,15 @@ def cmd_duplicates_llm() -> None:
             continue
 
         group = {**group, "delete": live_delete_ids}
+        llm_duplicate_log("shown_group", index=group_index, total=len(groups), group=group)
         print_llm_duplicate_group(group, id_to_path, group_index, len(groups))
         status, processed_delta = apply_llm_duplicate_group(group, id_to_path, state.root)
+        llm_duplicate_log(
+            "group_user_action_result",
+            index=group_index,
+            status=status,
+            processed_delta=processed_delta,
+        )
         processed += processed_delta
 
         if status == "quit":
