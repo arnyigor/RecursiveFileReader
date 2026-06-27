@@ -4,7 +4,6 @@ File Sorter Assistant
 Интерактивный сортировщик файлов с помощью локальной LLM llama.cpp / LM Studio
 Python 3.12 | OpenAI-compatible /v1/chat/completions | JSON Mode
 """
-
 import os
 import sys
 import json
@@ -21,20 +20,17 @@ import threading
 import tempfile
 from difflib import SequenceMatcher
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict, is_dataclass
 from send2trash import send2trash
 
 # ─────────────────────────────────────────────
 #  Конфигурация
 # ─────────────────────────────────────────────
-
 LLAMACPP_URL = "http://127.0.0.1:8080/v1/chat/completions"
 MODEL_NAME = "gemma-4"
-
 TEMPERATURE = 0.1
 MAX_TOKENS = 32768
 REQUEST_TIMEOUT = 120
-
 MAX_DEPTH = 5
 MAX_RECOMMENDATIONS = 5
 MAX_ARCHIVE_SCAN_ENTRIES = 5000
@@ -52,15 +48,12 @@ DUPLICATE_REVIEW_FOLDER = "_duplicates_review"
 LLM_DUPLICATE_MAX_FILES = 300
 LLM_DUPLICATE_MAX_GROUPS = 30
 LLM_DUPLICATE_MAX_HINT_GROUPS = 40
-
 DEFAULT_AUTO_SELECT_SECONDS = 60
 
 # Если True — при авто-выборе папка будет создана без вопроса.
 AUTO_CREATE_FOLDER_ON_TIMEOUT = True
-
 # Если True — при авто-выборе файл будет перемещен без подтверждения.
 AUTO_MOVE_WITHOUT_CONFIRMATION = True
-
 # Небольшой запас на случай, если пользователь нажал клавишу ровно на границе таймаута.
 TIMEOUT_INPUT_GRACE_SECONDS = 1.0
 
@@ -71,31 +64,29 @@ SCRIPT_DIR = (
 )
 CONFIG_PATH = SCRIPT_DIR / "file_sorter_assistant.ini"
 LLM_DUPLICATE_LOG_DIR = SCRIPT_DIR / "llm_duplicate_logs"
+START_LOG_DIR = SCRIPT_DIR / "start_logs"
 LLM_DUPLICATE_DEBUG_LOG: Path | None = None
-
+START_DEBUG_LOG: Path | None = None
 
 # ─────────────────────────────────────────────
 #  Архитектура состояний
 # ─────────────────────────────────────────────
-
-
 @dataclass
 class SortSession:
     root: Path | None = None
     dest: Path | None = None
     tree_str: str = ""
     flat_paths: list[str] = field(default_factory=list)
-
     # 0 = автовыбор отключен
     auto_select_seconds: int = DEFAULT_AUTO_SELECT_SECONDS
+    include_extensions: set[str] = field(default_factory=set)
+    sort_by: str = "name"          # name | size | date | none
 
     @property
     def target_dir(self) -> Path | None:
         return self.dest if self.dest else self.root
 
-
 state = SortSession()
-
 
 @dataclass
 class ArchiveInspection:
@@ -115,13 +106,11 @@ class ArchiveInspection:
     reason: str = ""
     error: str = ""
 
-
 @dataclass
 class ArchiveEntryDetail:
     path: str
     size: int | None = None
     modified: str = ""
-
 
 @dataclass(frozen=True)
 class ArchiveStructureSignature:
@@ -131,12 +120,9 @@ class ArchiveStructureSignature:
     suffixes: frozenset[str]
     entry_count: int
 
-
 # ─────────────────────────────────────────────
 #  Вспомогательные функции путей
 # ─────────────────────────────────────────────
-
-
 def normalize_rel_folder(folder: str) -> str | None:
     """
     Нормализует путь папки от LLM:
@@ -149,28 +135,21 @@ def normalize_rel_folder(folder: str) -> str | None:
     """
     if not isinstance(folder, str):
         return None
-
     folder = folder.strip().replace("\\", "/")
     folder = re.sub(r"/+", "/", folder)
     folder = folder.strip("/")
-
     if not folder or folder == ".":
         return None
-
     parts = folder.split("/")
     if any(part in ("", ".", "..") for part in parts):
         return None
-
     # Запрет Windows-дисков вида C:/...
     if re.match(r"^[a-zA-Z]:", folder):
         return None
-
     # Запрет абсолютных путей
     if Path(folder).is_absolute():
         return None
-
     return folder
-
 
 def safe_join_base(base: Path, rel_folder: str) -> Path | None:
     """
@@ -180,26 +159,19 @@ def safe_join_base(base: Path, rel_folder: str) -> Path | None:
     normalized = normalize_rel_folder(rel_folder)
     if not normalized:
         return None
-
     base_resolved = base.resolve()
     dest = (base_resolved / normalized).resolve()
-
     if dest != base_resolved and base_resolved not in dest.parents:
         return None
-
     return dest
-
 
 def path_exists_in_base(base: Path, rel_path: str) -> bool:
     dest = safe_join_base(base, rel_path)
     return bool(dest and dest.is_dir())
 
-
 # ─────────────────────────────────────────────
 #  INI config
 # ─────────────────────────────────────────────
-
-
 def load_config() -> None:
     if not CONFIG_PATH.exists():
         return
@@ -236,6 +208,19 @@ def load_config() -> None:
         except ValueError:
             print(f"  [!] Некорректный auto_select_seconds в ini: {timeout_raw}")
 
+    # --- фильтр расширений ---
+    ext_raw = settings.get("include_extensions", "").strip()
+    if ext_raw:
+        state.include_extensions = {
+            ext.strip().lower()
+            for ext in ext_raw.split()
+            if ext.strip().startswith(".")
+        }
+
+    # --- сортировка ---
+    sort_raw = settings.get("sort_by", "name").strip().lower()
+    if sort_raw in ("name", "size", "date", "none"):
+        state.sort_by = sort_raw
 
 def save_config() -> None:
     config = configparser.ConfigParser()
@@ -245,8 +230,12 @@ def save_config() -> None:
         "dest": str(state.dest) if state.dest else "",
     }
 
+    ext_str = " ".join(sorted(state.include_extensions)) if state.include_extensions else ""
+
     config["settings"] = {
         "auto_select_seconds": str(state.auto_select_seconds),
+        "include_extensions": ext_str,
+        "sort_by": state.sort_by,
     }
 
     try:
@@ -255,35 +244,71 @@ def save_config() -> None:
     except OSError as e:
         print(f"  [ОШИБКА] Не удалось сохранить ini: {e}")
 
-
 # ─────────────────────────────────────────────
 #  Дерево папок
 # ─────────────────────────────────────────────
-
-
 def json_log_safe(value):
     if isinstance(value, Path):
         return str(value)
-
+    if is_dataclass(value) and not isinstance(value, type):
+        return json_log_safe(asdict(value))
     if isinstance(value, dict):
         return {str(key): json_log_safe(item) for key, item in value.items()}
-
     if isinstance(value, (list, tuple, set, frozenset)):
         return [json_log_safe(item) for item in value]
-
     return value
 
-
-def llm_duplicate_log(event: str, **payload) -> None:
-    if not LLM_DUPLICATE_DEBUG_LOG:
+def start_sort_log(event: str, **payload) -> None:
+    if not START_DEBUG_LOG:
         return
-
     record = {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "event": event,
         **payload,
     }
+    try:
+        with START_DEBUG_LOG.open("a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(json_log_safe(record), ensure_ascii=False, default=str))
+            log_file.write("\n")
+    except OSError as e:
+        print(f"  [start-log] Не удалось записать лог: {e}")
 
+def start_sort_session_log(root: Path, target: Path, files: list[Path]) -> Path | None:
+    global START_DEBUG_LOG
+    try:
+        START_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        START_DEBUG_LOG = START_LOG_DIR / f"start-{timestamp}.jsonl"
+        start_sort_log(
+            "session_start",
+            root=root,
+            target=target,
+            file_count=len(files),
+            files=[str(file_path) for file_path in files],
+            include_extensions=sorted(state.include_extensions),
+            sort_by=state.sort_by,
+            auto_select_seconds=state.auto_select_seconds,
+            auto_create_folder_on_timeout=AUTO_CREATE_FOLDER_ON_TIMEOUT,
+            auto_move_without_confirmation=AUTO_MOVE_WITHOUT_CONFIRMATION,
+            model=MODEL_NAME,
+            url=LLAMACPP_URL,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+        )
+        return START_DEBUG_LOG
+    except OSError as e:
+        START_DEBUG_LOG = None
+        print(f"  [start-log] Не удалось создать лог: {e}")
+        return None
+
+def llm_duplicate_log(event: str, **payload) -> None:
+    if not LLM_DUPLICATE_DEBUG_LOG:
+        return
+    record = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event": event,
+        **payload,
+    }
     try:
         with LLM_DUPLICATE_DEBUG_LOG.open("a", encoding="utf-8") as log_file:
             log_file.write(json.dumps(json_log_safe(record), ensure_ascii=False, default=str))
@@ -291,10 +316,8 @@ def llm_duplicate_log(event: str, **payload) -> None:
     except OSError as e:
         print(f"  [dup-llm-log] Не удалось записать лог: {e}")
 
-
 def start_llm_duplicate_log(root: Path, files: list[Path]) -> Path | None:
     global LLM_DUPLICATE_DEBUG_LOG
-
     try:
         LLM_DUPLICATE_LOG_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -315,25 +338,18 @@ def start_llm_duplicate_log(root: Path, files: list[Path]) -> Path | None:
         print(f"  [dup-llm-log] Не удалось создать лог: {e}")
         return None
 
-
 def parse_llm_bool(value) -> bool:
     if isinstance(value, bool):
         return value
-
     if isinstance(value, str):
         lowered = value.strip().lower()
-
         if lowered in {"true", "1", "yes", "y"}:
             return True
-
         if lowered in {"false", "0", "no", "n", ""}:
             return False
-
     if isinstance(value, (int, float)):
         return bool(value)
-
     return False
-
 
 def build_tree(base_dir: Path, max_depth: int = MAX_DEPTH) -> tuple[str, list[str]]:
     """
@@ -346,7 +362,6 @@ def build_tree(base_dir: Path, max_depth: int = MAX_DEPTH) -> tuple[str, list[st
     def _walk(current: Path, prefix: str, depth: int) -> None:
         if depth > max_depth:
             return
-
         try:
             entries = sorted(
                 [e for e in current.iterdir() if e.is_dir() and not e.is_symlink()],
@@ -359,76 +374,56 @@ def build_tree(base_dir: Path, max_depth: int = MAX_DEPTH) -> tuple[str, list[st
             is_last = i == len(entries) - 1
             connector = "└── " if is_last else "├── "
             lines.append(f"{prefix}{connector}{entry.name}/")
-
             rel_path = str(entry.relative_to(base_dir)).replace("\\", "/")
             rel_path = normalize_rel_folder(rel_path)
-
             if rel_path:
                 flat_paths.append(rel_path)
-
             extension = "    " if is_last else "│   "
             _walk(entry, prefix + extension, depth + 1)
 
     lines.append(f"{base_dir.name}/")
     _walk(base_dir, "", 1)
-
     return "\n".join(lines), sorted(set(flat_paths))
-
 
 def refresh_folder_cache() -> bool:
     target = state.target_dir
-
     if not target:
         print("  [!] Сначала установите root или dest.")
         return False
-
     if not target.is_dir():
         print(f"  [!] Папка назначения недоступна: {target}")
         return False
-
     print(f"  [scan] Сканирование структуры: {target} до {MAX_DEPTH} уровней...")
     state.tree_str, state.flat_paths = build_tree(target, MAX_DEPTH)
     print(f"  [scan] Найдено папок: {len(state.flat_paths)}")
-
     return True
-
 
 def print_tree_numbered(flat_paths: list[str]) -> None:
     print()
-
     for i, path in enumerate(flat_paths, 1):
         depth = path.count("/")
         indent = "  " * depth
         name = path.split("/")[-1]
         print(f"  {i:>4}. {indent}{name}/  [{path}]")
-
     print()
-
 
 # ─────────────────────────────────────────────
 #  Общие вспомогательные функции
 # ─────────────────────────────────────────────
-
-
 def hr(char: str = "─", width: int = 60) -> str:
     return char * width
 
-
 def format_size(size_bytes: int) -> str:
     value = float(size_bytes)
-
     for unit in ("B", "KB", "MB", "GB"):
         if value < 1024:
             return f"{value:.1f} {unit}"
         value /= 1024
-
     return f"{value:.1f} TB"
-
 
 # ─────────────────────────────────────────────
 #  Быстрый просмотр архивов без распаковки
 # ─────────────────────────────────────────────
-
 ARCHIVE_SUFFIXES = (
     ".zip",
     ".tar",
@@ -456,54 +451,37 @@ TEXTURE_SUFFIXES = {
     ".dds",
 }
 
-
 def archive_suffix(path: Path) -> str | None:
     name = path.name.lower()
-
     for suffix in ARCHIVE_SUFFIXES:
         if name.endswith(suffix):
             return suffix
-
     return None
-
 
 def normalize_archive_entry(name: str) -> str | None:
     normalized = name.replace("\\", "/").strip("/")
-
     if not normalized or normalized.endswith("/"):
         return None
-
     parts = normalized.split("/")
-
     if any(part in ("", ".", "..") for part in parts):
         return None
-
     return normalized
-
 
 def limited_archive_entries(entries: list[str]) -> tuple[list[str], bool]:
     normalized = []
-
     for entry in entries:
         path = normalize_archive_entry(entry)
-
         if path:
             normalized.append(path)
-
     return normalized[:MAX_ARCHIVE_SCAN_ENTRIES], len(normalized) > MAX_ARCHIVE_SCAN_ENTRIES
-
 
 def limited_archive_entry_details(entries: list[ArchiveEntryDetail]) -> tuple[list[ArchiveEntryDetail], bool]:
     normalized: list[ArchiveEntryDetail] = []
-
     for entry in entries:
         path = normalize_archive_entry(entry.path)
-
         if path:
             normalized.append(ArchiveEntryDetail(path=path, size=entry.size, modified=entry.modified))
-
     return normalized[:MAX_ARCHIVE_SCAN_ENTRIES], len(normalized) > MAX_ARCHIVE_SCAN_ENTRIES
-
 
 def format_zip_datetime(date_time: tuple[int, int, int, int, int, int]) -> str:
     try:
@@ -511,24 +489,19 @@ def format_zip_datetime(date_time: tuple[int, int, int, int, int, int]) -> str:
     except Exception:
         return ""
 
-
 def format_timestamp(ts: float | int | None) -> str:
     if not ts:
         return ""
-
     try:
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
     except Exception:
         return ""
 
-
 def read_zip_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
     with zipfile.ZipFile(file_path) as archive:
         names = [info.filename for info in archive.infolist() if not info.is_dir()]
-
-    entries, truncated = limited_archive_entries(names)
-    return entries, len(names), truncated
-
+        entries, truncated = limited_archive_entries(names)
+        return entries, len(names), truncated
 
 def read_zip_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
     with zipfile.ZipFile(file_path) as archive:
@@ -541,39 +514,30 @@ def read_zip_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], i
             for info in archive.infolist()
             if not info.is_dir()
         ]
-
-    entries, truncated = limited_archive_entry_details(infos)
-    return entries, len(infos), truncated
-
+        entries, truncated = limited_archive_entry_details(infos)
+        return entries, len(infos), truncated
 
 def read_tar_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
     entries: list[str] = []
     truncated = False
-
     with tarfile.open(file_path, mode="r:*") as archive:
         for member in archive:
             if member.isfile():
                 path = normalize_archive_entry(member.name)
-
                 if path:
                     entries.append(path)
-
-            if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
-                truncated = True
-                break
-
+                if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
+                    truncated = True
+                    break
     return entries, None, truncated
-
 
 def read_tar_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
     entries: list[ArchiveEntryDetail] = []
     truncated = False
-
     with tarfile.open(file_path, mode="r:*") as archive:
         for member in archive:
             if member.isfile():
                 path = normalize_archive_entry(member.name)
-
                 if path:
                     entries.append(
                         ArchiveEntryDetail(
@@ -582,58 +546,43 @@ def read_tar_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], i
                             modified=format_timestamp(member.mtime),
                         )
                     )
-
-            if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
-                truncated = True
-                break
-
+                if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
+                    truncated = True
+                    break
     return entries, None, truncated
-
 
 def candidate_archive_tools(names: list[str], common_relative_paths: list[str]) -> list[str]:
     candidates: list[str] = []
-
     for name in names:
         path = shutil.which(name)
-
         if path:
             candidates.append(path)
-
     roots = [
         os.environ.get("ProgramFiles", ""),
         os.environ.get("ProgramFiles(x86)", ""),
         os.environ.get("LocalAppData", ""),
     ]
-
     for root in roots:
         if not root:
             continue
-
         for rel_path in common_relative_paths:
             path = Path(root) / rel_path
-
             if path.is_file():
                 candidates.append(str(path))
-
     unique: list[str] = []
-
     for path in candidates:
         if path not in unique:
             unique.append(path)
-
     return unique
-
 
 def run_archive_tool(args: list[str], timeout: int) -> tuple[subprocess.CompletedProcess[str] | None, str]:
     startupinfo = None
     creationflags = 0
-
     if os.name == "nt":
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = 0
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
     try:
         completed = subprocess.run(
             args,
@@ -650,24 +599,17 @@ def run_archive_tool(args: list[str], timeout: int) -> tuple[subprocess.Complete
     except Exception as e:
         return None, str(e)
 
-
 def parse_7z_slt_output(output: str, archive_name: str) -> tuple[list[str], int | None, bool]:
     entries: list[str] = []
-
     for line in output.splitlines():
         if not line.startswith("Path = "):
             continue
-
         path = normalize_archive_entry(line[len("Path = ") :])
-
         if path and path != archive_name:
             entries.append(path)
-
         if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
             return entries, None, True
-
     return entries, len(entries), False
-
 
 def parse_7z_slt_details(output: str, archive_name: str) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
     entries: list[ArchiveEntryDetail] = []
@@ -676,25 +618,19 @@ def parse_7z_slt_details(output: str, archive_name: str) -> tuple[list[ArchiveEn
     def flush_current() -> None:
         if not current:
             return
-
         path = normalize_archive_entry(current.get("Path", ""))
-
         if not path or path == archive_name:
             current.clear()
             return
-
         attributes = current.get("Attributes", "")
         size_raw = current.get("Size", "")
-
         if "D" in attributes and not size_raw:
             current.clear()
             return
-
         try:
             size = int(size_raw) if size_raw else None
         except ValueError:
             size = None
-
         modified = current.get("Modified", "")[:16]
         entries.append(ArchiveEntryDetail(path=path, size=size, modified=modified))
         current.clear()
@@ -703,39 +639,29 @@ def parse_7z_slt_details(output: str, archive_name: str) -> tuple[list[ArchiveEn
         if not line.strip():
             flush_current()
             continue
-
         if " = " not in line:
             continue
-
         key, value = line.split(" = ", 1)
-
         if key == "Path" and current:
             flush_current()
-
         current[key] = value
-
         if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
             return entries, None, True
-
     flush_current()
     return entries[:MAX_ARCHIVE_SCAN_ENTRIES], len(entries), len(entries) > MAX_ARCHIVE_SCAN_ENTRIES
 
-
 def read_7z_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
     py7zr_error = ""
-
     try:
         import py7zr  # type: ignore
-
         with py7zr.SevenZipFile(file_path, mode="r") as archive:
             names = [
                 info.filename
                 for info in archive.list()
                 if getattr(info, "is_file", False)
             ]
-
-        entries, truncated = limited_archive_entries(names)
-        return entries, len(names), truncated
+            entries, truncated = limited_archive_entries(names)
+            return entries, len(names), truncated
     except ImportError:
         pass
     except Exception as e:
@@ -749,7 +675,6 @@ def read_7z_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
             "NanaZip/NanaZipC.exe",
         ],
     )
-
     if not tools:
         suffix = f"; {py7zr_error}" if py7zr_error else ""
         raise RuntimeError(
@@ -758,7 +683,6 @@ def read_7z_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
         )
 
     errors: list[str] = [py7zr_error] if py7zr_error else []
-
     for exe in tools:
         completed = subprocess.run(
             [exe, "l", "-slt", str(file_path)],
@@ -769,35 +693,26 @@ def read_7z_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
             timeout=15,
             check=False,
         )
-
         if completed.returncode == 0:
             return parse_7z_slt_output(completed.stdout, file_path.name)
-
         errors.append(completed.stderr.strip() or completed.stdout.strip() or exe)
-
     raise RuntimeError("; ".join(errors))
-
 
 def read_7z_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
     py7zr_error = ""
-
     try:
         import py7zr  # type: ignore
-
         with py7zr.SevenZipFile(file_path, mode="r") as archive:
             infos = []
-
             for info in archive.list():
                 if not getattr(info, "is_file", False):
                     continue
-
                 size = getattr(info, "uncompressed", None)
                 modified = getattr(info, "lastwritetime", None)
                 modified_text = modified.strftime("%Y-%m-%d %H:%M") if modified else ""
                 infos.append(ArchiveEntryDetail(path=info.filename, size=size, modified=modified_text))
-
-        entries, truncated = limited_archive_entry_details(infos)
-        return entries, len(infos), truncated
+            entries, truncated = limited_archive_entry_details(infos)
+            return entries, len(infos), truncated
     except ImportError:
         pass
     except Exception as e:
@@ -811,7 +726,6 @@ def read_7z_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], in
             "NanaZip/NanaZipC.exe",
         ],
     )
-
     if not tools:
         suffix = f"; {py7zr_error}" if py7zr_error else ""
         raise RuntimeError(
@@ -820,7 +734,6 @@ def read_7z_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], in
         )
 
     errors: list[str] = [py7zr_error] if py7zr_error else []
-
     for exe in tools:
         completed = subprocess.run(
             [exe, "l", "-slt", str(file_path)],
@@ -831,34 +744,26 @@ def read_7z_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], in
             timeout=20,
             check=False,
         )
-
         if completed.returncode == 0:
             return parse_7z_slt_details(completed.stdout, file_path.name)
-
         errors.append(completed.stderr.strip() or completed.stdout.strip() or exe)
-
     raise RuntimeError("; ".join(errors))
-
 
 def read_rar_entries_with_rarfile(file_path: Path) -> tuple[list[str], int | None, bool] | None:
     try:
         import rarfile  # type: ignore
     except ImportError:
         return None
-
     with rarfile.RarFile(file_path) as archive:
         names = [info.filename for info in archive.infolist() if not info.isdir()]
-
-    entries, truncated = limited_archive_entries(names)
-    return entries, len(names), truncated
-
+        entries, truncated = limited_archive_entries(names)
+        return entries, len(names), truncated
 
 def read_rar_entry_details_with_rarfile(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool] | None:
     try:
         import rarfile  # type: ignore
     except ImportError:
         return None
-
     with rarfile.RarFile(file_path) as archive:
         infos = [
             ArchiveEntryDetail(
@@ -869,41 +774,30 @@ def read_rar_entry_details_with_rarfile(file_path: Path) -> tuple[list[ArchiveEn
             for info in archive.infolist()
             if not info.isdir()
         ]
-
-    entries, truncated = limited_archive_entry_details(infos)
-    return entries, len(infos), truncated
-
+        entries, truncated = limited_archive_entry_details(infos)
+        return entries, len(infos), truncated
 
 def parse_unrar_list_output(output: str) -> tuple[list[str], int | None, bool]:
     entries: list[str] = []
     seen: set[str] = set()
-
     for line in output.splitlines():
         path = normalize_archive_entry(line)
-
         if not path:
             continue
-
         # UnRAR/WinRAR can list directories in bare mode. Keep likely files only.
         if "." not in Path(path).name:
             continue
-
         if path in seen:
             continue
-
         seen.add(path)
         entries.append(path)
-
         if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
             return entries, None, True
-
     return entries, len(entries), False
-
 
 def parse_unrar_technical_details(output: str) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
     entries: list[ArchiveEntryDetail] = []
     current: dict[str, str] = {}
-
     key_map = {
         "name": "path",
         "path": "path",
@@ -919,21 +813,16 @@ def parse_unrar_technical_details(output: str) -> tuple[list[ArchiveEntryDetail]
     def flush_current() -> None:
         if not current:
             return
-
         path = normalize_archive_entry(current.get("path", ""))
-
         if not path:
             current.clear()
             return
-
         size_raw = current.get("size", "")
         size_match = re.search(r"\d+", size_raw.replace(" ", ""))
-
         try:
             size = int(size_match.group(0)) if size_match else None
         except ValueError:
             size = None
-
         entries.append(
             ArchiveEntryDetail(
                 path=path,
@@ -945,61 +834,44 @@ def parse_unrar_technical_details(output: str) -> tuple[list[ArchiveEntryDetail]
 
     for raw_line in output.splitlines():
         line = raw_line.strip()
-
         if not line:
             flush_current()
             continue
-
         if ":" in line:
             raw_key, value = line.split(":", 1)
         elif "=" in line:
             raw_key, value = line.split("=", 1)
         else:
             continue
-
         key = key_map.get(raw_key.strip().lower())
-
         if not key:
             continue
-
         if key == "path" and current.get("path"):
             flush_current()
-
         current[key] = value.strip()
-
         if len(entries) >= MAX_ARCHIVE_SCAN_ENTRIES:
             return entries, None, True
-
     flush_current()
-
     if not entries:
         raise RuntimeError("technical list не содержит распознанных файлов")
-
     return entries[:MAX_ARCHIVE_SCAN_ENTRIES], len(entries), len(entries) > MAX_ARCHIVE_SCAN_ENTRIES
-
 
 def read_rar_entry_details_with_bare_list(file_path: Path, exe: str) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
     completed, error = run_archive_tool([exe, "lb", str(file_path)], timeout=20)
-
     if completed is None:
         raise RuntimeError(error or exe)
-
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or exe)
-
     names, total_entries, truncated = parse_unrar_list_output(completed.stdout)
     return [ArchiveEntryDetail(path=name) for name in names], total_entries, truncated
 
-
 def read_rar_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
     errors: list[str] = []
-
     try:
         rarfile_result = read_rar_entries_with_rarfile(file_path)
     except Exception as e:
         rarfile_result = None
         errors.append(f"rarfile: {e}")
-
     if rarfile_result is not None:
         return rarfile_result
 
@@ -1007,17 +879,13 @@ def read_rar_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
         names=["7z", "7za", "7z.exe", "7za.exe"],
         common_relative_paths=["7-Zip/7z.exe", "7-Zip/7za.exe"],
     )
-
     for exe in seven_zip_tools:
         completed, error = run_archive_tool([exe, "l", "-slt", str(file_path)], timeout=15)
-
         if completed is None:
             errors.append(error or exe)
             continue
-
         if completed.returncode == 0:
             return parse_7z_slt_output(completed.stdout, file_path.name)
-
         errors.append(completed.stderr.strip() or completed.stdout.strip() or exe)
 
     rar_tools = candidate_archive_tools(
@@ -1027,17 +895,13 @@ def read_rar_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
             "WinRAR/Rar.exe",
         ],
     )
-
     for exe in rar_tools:
         completed, error = run_archive_tool([exe, "lb", str(file_path)], timeout=15)
-
         if completed is None:
             errors.append(error or exe)
             continue
-
         if completed.returncode == 0:
             return parse_unrar_list_output(completed.stdout)
-
         errors.append(completed.stderr.strip() or completed.stdout.strip() or exe)
 
     details = "; ".join(errors)
@@ -1047,16 +911,13 @@ def read_rar_entries(file_path: Path) -> tuple[list[str], int | None, bool]:
         f"{suffix}"
     )
 
-
 def read_rar_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
     errors: list[str] = []
-
     try:
         rarfile_result = read_rar_entry_details_with_rarfile(file_path)
     except Exception as e:
         rarfile_result = None
         errors.append(f"rarfile: {e}")
-
     if rarfile_result is not None:
         return rarfile_result
 
@@ -1064,17 +925,13 @@ def read_rar_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], i
         names=["7z", "7za", "7z.exe", "7za.exe"],
         common_relative_paths=["7-Zip/7z.exe", "7-Zip/7za.exe"],
     )
-
     for exe in seven_zip_tools:
         completed, error = run_archive_tool([exe, "l", "-slt", str(file_path)], timeout=20)
-
         if completed is None:
             errors.append(error or exe)
             continue
-
         if completed.returncode == 0:
             return parse_7z_slt_details(completed.stdout, file_path.name)
-
         errors.append(completed.stderr.strip() or completed.stdout.strip() or exe)
 
     rar_tools = candidate_archive_tools(
@@ -1084,14 +941,11 @@ def read_rar_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], i
             "WinRAR/Rar.exe",
         ],
     )
-
     for exe in rar_tools:
         completed, error = run_archive_tool([exe, "lt", str(file_path)], timeout=20)
-
         if completed is None:
             errors.append(error or exe)
             continue
-
         if completed.returncode == 0:
             try:
                 return parse_unrar_technical_details(completed.stdout)
@@ -1105,9 +959,7 @@ def read_rar_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], i
             return read_rar_entry_details_with_bare_list(file_path, exe)
         except Exception as e:
             errors.append(f"{exe} lb: {e}")
-
     raise RuntimeError("; ".join(errors) or "не удалось прочитать подробности rar")
-
 
 def classify_archive_entries(entries: list[str]) -> tuple[str | None, str]:
     lower_entries = [entry.lower() for entry in entries]
@@ -1128,60 +980,42 @@ def classify_archive_entries(entries: list[str]) -> tuple[str | None, str]:
 
     if has_uproject:
         return "ue_project", "найден .uproject внутри архива"
-
     if has_uplugin:
         return "ue_plugin", "найден .uplugin внутри архива"
-
     if has_hda:
         return "houdini_asset", "найдены Houdini Digital Assets (.hda)"
-
     if has_unitypackage:
         return "unity_package", "найден .unitypackage внутри архива"
-
     if has_adobe_extension:
         return "adobe_extension", "найдены Adobe/Photoshop extension файлы"
-
     if has_uasset:
         return "ue_content", "найдены Unreal Engine content файлы (.uasset)"
-
     if has_init_py:
         return "blender_addon", "найден __init__.py внутри архива"
-
     if has_blend and has_texture:
         return "blender_assets", "найдены .blend файл и текстуры"
-
     if has_blend:
         return "blender_assets", "найден .blend файл"
-
     return None, ""
-
 
 def read_archive_entry_details(file_path: Path) -> tuple[list[ArchiveEntryDetail], int | None, bool]:
     suffix = archive_suffix(file_path)
-
     if suffix == ".zip":
         return read_zip_entry_details(file_path)
-
     if suffix in {".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"}:
         return read_tar_entry_details(file_path)
-
     if suffix == ".7z":
         return read_7z_entry_details(file_path)
-
     if suffix == ".rar":
         return read_rar_entry_details(file_path)
-
     raise RuntimeError("неподдерживаемый архив")
-
 
 def archive_detail_key_file(entry: ArchiveEntryDetail) -> bool:
     path = entry.path.lower()
     name = Path(path).name
     suffix = Path(path).suffix.lower()
-
     if name in {"__init__.py", "blender_manifest.toml", "package.json", "manifest.json"}:
         return True
-
     if suffix in {
         ".blend",
         ".py",
@@ -1199,15 +1033,12 @@ def archive_detail_key_file(entry: ArchiveEntryDetail) -> bool:
         ".ccx",
     }:
         return True
-
     return False
-
 
 def format_archive_entry_detail(entry: ArchiveEntryDetail) -> str:
     size = format_size(entry.size) if entry.size is not None else "?"
     modified = entry.modified or "?"
     return f"{entry.path} | size={size} | modified={modified}"
-
 
 def nested_archive_entries(entries: list[ArchiveEntryDetail]) -> list[ArchiveEntryDetail]:
     nested = [
@@ -1217,63 +1048,46 @@ def nested_archive_entries(entries: list[ArchiveEntryDetail]) -> list[ArchiveEnt
     ]
     return sorted(nested, key=lambda entry: entry.size or 0, reverse=True)[:MAX_NESTED_ARCHIVES_PER_PARENT]
 
-
 def safe_nested_output_path(tmp_dir: Path, entry_path: str) -> Path:
     name = Path(entry_path.replace("\\", "/")).name
     name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" ._")
-
     if not name:
         name = "nested_archive"
-
     return tmp_dir / name
-
 
 def extract_nested_archive(parent_path: Path, entry_path: str, output_path: Path) -> None:
     suffix = archive_suffix(parent_path)
-
     if suffix == ".zip":
         with zipfile.ZipFile(parent_path) as archive:
             with archive.open(entry_path) as src, output_path.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
         return
-
     if suffix in {".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"}:
         with tarfile.open(parent_path, mode="r:*") as archive:
             member = archive.getmember(entry_path)
             src = archive.extractfile(member)
-
             if src is None:
                 raise RuntimeError("tar member cannot be extracted as file")
-
             with src, output_path.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
         return
-
     if suffix == ".rar":
         import rarfile  # type: ignore
-
         with rarfile.RarFile(parent_path) as archive:
             with archive.open(entry_path) as src, output_path.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
         return
-
     if suffix == ".7z":
         import py7zr  # type: ignore
-
         with py7zr.SevenZipFile(parent_path, mode="r") as archive:
             archive.extract(path=output_path.parent, targets=[entry_path])
-
-        extracted_path = output_path.parent / entry_path
-
-        if not extracted_path.exists():
-            raise RuntimeError("py7zr did not extract requested nested archive")
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(extracted_path), str(output_path))
+            extracted_path = output_path.parent / entry_path
+            if not extracted_path.exists():
+                raise RuntimeError("py7zr did not extract requested nested archive")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(extracted_path), str(output_path))
         return
-
     raise RuntimeError("parent archive type does not support nested extraction")
-
 
 def format_nested_archive_report(parent_path: Path, nested_entry: ArchiveEntryDetail) -> tuple[str, list[ArchiveEntryDetail]]:
     if nested_entry.size is not None and nested_entry.size > MAX_NESTED_ARCHIVE_BYTES:
@@ -1281,7 +1095,6 @@ def format_nested_archive_report(parent_path: Path, nested_entry: ArchiveEntryDe
             f"nested_archive: {nested_entry.path} | size={format_size(nested_entry.size)} | skipped=too_large",
             [],
         )
-
     try:
         with tempfile.TemporaryDirectory(prefix="file_sorter_nested_") as tmp:
             tmp_dir = Path(tmp)
@@ -1296,6 +1109,7 @@ def format_nested_archive_report(parent_path: Path, nested_entry: ArchiveEntryDe
     classification, reason = classify_archive_entries(paths)
     sample = entries[:MAX_DUPLICATE_ARCHIVE_REPORT_FILES]
     key_entries = [entry for entry in entries if archive_detail_key_file(entry)][:MAX_DUPLICATE_ARCHIVE_REPORT_FILES]
+
     report = "\n".join(
         [
             f"nested_archive: {nested_entry.path}",
@@ -1311,7 +1125,6 @@ def format_nested_archive_report(parent_path: Path, nested_entry: ArchiveEntryDe
             *[f"    - {format_archive_entry_detail(entry)}" for entry in sample],
         ]
     )
-
     prefixed_entries = [
         ArchiveEntryDetail(
             path=f"{nested_entry.path}::{entry.path}",
@@ -1322,11 +1135,9 @@ def format_nested_archive_report(parent_path: Path, nested_entry: ArchiveEntryDe
     ]
     return report, prefixed_entries
 
-
 def format_duplicate_archive_deep_report(file_id: int, file_path: Path) -> tuple[str, list[ArchiveEntryDetail]]:
     if not archive_suffix(file_path):
         return f"[{file_id}] {file_path.name}\narchive: no\n", []
-
     try:
         entries, total_entries, truncated = read_archive_entry_details(file_path)
     except Exception as e:
@@ -1340,17 +1151,17 @@ def format_duplicate_archive_deep_report(file_id: int, file_path: Path) -> tuple
     classification, reason = classify_archive_entries(paths)
     known_sizes = [entry.size for entry in entries if entry.size is not None]
     total_size = sum(known_sizes)
+
     extension_counts: dict[str, int] = {}
     modified_values = [entry.modified for entry in entries if entry.modified]
-
     for entry in entries:
         suffix = Path(entry.path).suffix.lower() or "<no_ext>"
         extension_counts[suffix] = extension_counts.get(suffix, 0) + 1
-
     ext_summary = ", ".join(
         f"{suffix}:{count}"
         for suffix, count in sorted(extension_counts.items(), key=lambda item: (-item[1], item[0]))[:12]
     )
+
     largest_entries = sorted(entries, key=lambda entry: entry.size or 0, reverse=True)[
         :MAX_DUPLICATE_ARCHIVE_REPORT_FILES
     ]
@@ -1360,9 +1171,9 @@ def format_duplicate_archive_deep_report(file_id: int, file_path: Path) -> tuple
         if archive_detail_key_file(entry)
     ][:MAX_DUPLICATE_ARCHIVE_REPORT_FILES]
     sample_entries = entries[:MAX_DUPLICATE_ARCHIVE_REPORT_FILES]
+
     nested_reports: list[str] = []
     nested_detail_entries: list[ArchiveEntryDetail] = []
-
     for nested_entry in nested_archive_entries(entries):
         nested_report, nested_entries = format_nested_archive_report(file_path, nested_entry)
         nested_reports.append(nested_report)
@@ -1387,7 +1198,6 @@ def format_duplicate_archive_deep_report(file_id: int, file_path: Path) -> tuple
         "sample_files:",
         *[f"  - {format_archive_entry_detail(entry)}" for entry in sample_entries],
     ]
-
     if nested_reports:
         parts.extend(
             [
@@ -1395,9 +1205,7 @@ def format_duplicate_archive_deep_report(file_id: int, file_path: Path) -> tuple
                 *nested_reports,
             ]
         )
-
     return "\n".join(parts) + "\n", entries + nested_detail_entries
-
 
 def format_archive_structure_comparison(details_by_id: dict[int, list[ArchiveEntryDetail]], id_to_path: dict[int, Path]) -> str:
     if len(details_by_id) < 2:
@@ -1411,8 +1219,10 @@ def format_archive_structure_comparison(details_by_id: dict[int, list[ArchiveEnt
         file_id: {Path(entry.path.lower()).name for entry in entries}
         for file_id, entries in details_by_id.items()
     }
+
     all_path_sets = list(path_sets.values())
     common_paths = set.intersection(*all_path_sets) if all_path_sets else set()
+
     lines = [
         f"common_exact_paths_count: {len(common_paths)}",
         "common_exact_paths_sample:",
@@ -1422,12 +1232,10 @@ def format_archive_structure_comparison(details_by_id: dict[int, list[ArchiveEnt
     for file_id, paths in path_sets.items():
         other_paths: set[str] = set()
         other_basenames: set[str] = set()
-
         for other_id, other_set in path_sets.items():
             if other_id != file_id:
                 other_paths |= other_set
                 other_basenames |= basename_sets[other_id]
-
         unique_paths = paths - other_paths
         common_basenames = basename_sets[file_id] & other_basenames
         lines.extend(
@@ -1441,33 +1249,25 @@ def format_archive_structure_comparison(details_by_id: dict[int, list[ArchiveEnt
                 *[f"    - {name}" for name in sorted(common_basenames)[:MAX_DUPLICATE_ARCHIVE_UNIQUE_PATHS]],
             ]
         )
-
     return "\n".join(lines)
-
 
 def format_duplicate_archives_deep_review(archive_ids: list[int], id_to_path: dict[int, Path]) -> str:
     reports: list[str] = []
     details_by_id: dict[int, list[ArchiveEntryDetail]] = {}
-
     for file_id in archive_ids:
         report, entries = format_duplicate_archive_deep_report(file_id, id_to_path[file_id])
         reports.append(report)
-
         if entries:
             details_by_id[file_id] = entries
-
     comparison = format_archive_structure_comparison(details_by_id, id_to_path)
-    return "\n\n".join(reports + ["Archive structure comparison:", comparison])
-
+    return "\n".join(reports + ["Archive structure comparison:", comparison])
 
 def inspect_archive(file_path: Path) -> ArchiveInspection:
     suffix = archive_suffix(file_path)
-
     if not suffix:
         return ArchiveInspection()
 
     info = ArchiveInspection(inspected=True, supported=True, archive_type=suffix.lstrip("."))
-
     try:
         if suffix == ".zip":
             entries, total_entries, truncated = read_zip_entries(file_path)
@@ -1491,31 +1291,28 @@ def inspect_archive(file_path: Path) -> ArchiveInspection:
     info.total_entries = total_entries
     info.truncated = truncated
     info.preview_entries = entries[:MAX_ARCHIVE_PREVIEW_ENTRIES]
+
     info.has_init_py = "__init__.py" in basenames
     info.has_blend = any(name.endswith(".blend") for name in lower_entries)
     info.has_texture = any(Path(name).suffix.lower() in TEXTURE_SUFFIXES for name in lower_entries)
     info.has_uproject = any(name.endswith(".uproject") for name in lower_entries)
     info.has_uplugin = any(name.endswith(".uplugin") for name in lower_entries)
+
     info.classification, info.reason = classify_archive_entries(entries)
-
     return info
-
 
 def print_archive_inspection(info: ArchiveInspection) -> None:
     if not info.inspected:
         return
-
     if not info.supported:
         print(f"  [archive] Не удалось быстро прочитать архив: {info.error}")
         return
 
     total = f" из {info.total_entries}" if info.total_entries is not None else ""
     suffix = " (лимит сканирования)" if info.truncated else ""
-
     print(f"  [archive] {info.archive_type}: просмотрено {info.entries_scanned}{total} файлов{suffix}")
 
     signals: list[str] = []
-
     if info.has_init_py:
         signals.append("__init__.py")
     if info.has_blend:
@@ -1534,55 +1331,66 @@ def print_archive_inspection(info: ArchiveInspection) -> None:
         signals.append(".unitypackage")
     if info.classification == "adobe_extension":
         signals.append("Adobe extension")
-
     if signals:
         print(f"  [archive] Признаки: {', '.join(signals)}")
-
     if info.classification:
         print(f"  [archive] Быстрый вывод: {info.classification} — {info.reason}")
-
     if info.preview_entries:
         print("  [archive] Первые файлы:")
-
         for entry in info.preview_entries:
             print(f"        - {entry}")
 
-
 def get_files_in_root(root: Path) -> list[Path]:
     try:
-        return sorted(
-            [p for p in root.iterdir() if p.is_file() and not p.is_symlink()],
-            key=lambda p: p.name.lower(),
-        )
+        files = [
+            p for p in root.iterdir()
+            if p.is_file() and not p.is_symlink()
+        ]
     except (PermissionError, OSError) as e:
         print(f"  [ОШИБКА] Не удалось прочитать root: {e}")
         return []
 
+    # Фильтр по расширениям (если задан в ini/командой)
+    if state.include_extensions:
+        files = [
+            p for p in files
+            if p.suffix.lower() in state.include_extensions
+        ]
+
+    # Сортировка
+    if state.sort_by == "name":
+        files.sort(key=lambda p: p.name.lower())
+    elif state.sort_by == "size":
+        files.sort(
+            key=lambda p: p.stat().st_size if p.exists() else 0,
+            reverse=True,
+        )
+    elif state.sort_by == "date":
+        files.sort(
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+    # "none" — оставляем порядок os.listdir()
+
+    return files
 
 def resolve_destination(dest_folder: Path, filename: str) -> Path:
     dest = dest_folder / filename
-
     if not dest.exists():
         return dest
-
     stem = Path(filename).stem
     suffix = Path(filename).suffix
     counter = 1
-
     while True:
         new_name = f"{stem} ({counter}){suffix}"
         dest = dest_folder / new_name
-
         if not dest.exists():
             return dest
-
         counter += 1
-
 
 # ─────────────────────────────────────────────
 #  Поиск дублей и похожих версий в root
 # ─────────────────────────────────────────────
-
 VERSION_PATTERNS = (
     r"\bv?\d+(?:[._-]\d+){1,4}[a-z]?\b",
     r"\bv\d+\b",
@@ -1601,11 +1409,13 @@ VERSION_PATTERNS = (
 VERSION_EXTRACT_RE = re.compile(
     r"(?i)(?:^|[^a-z0-9])(?:v|ver(?:sion)?[._ -]*)?(\d+(?:[._-]\d+){0,5}[a-z]?)(?=$|[^a-z0-9])"
 )
+
 EXPLICIT_VERSION_EXTRACT_RE = re.compile(
     r"(?i)(?:^|[^a-z0-9])(?:v|ver(?:sion)?[._ -]*)(\d+(?:[._-]\d+){0,5}[a-z]?)(?=$|[^a-z0-9])"
 )
 
 COMPACT_VERSION_RE = re.compile(r"(?i)(?<=[a-z])(\d{3})(?:[a-z]*)$")
+
 COMPACT_DROP_WORDS = (
     "enterprise",
     "professional",
@@ -1619,6 +1429,7 @@ COMPACT_DROP_WORDS = (
     "x64",
     "x86",
 )
+
 DUPLICATE_GENERIC_NAME_TOKENS = {
     "procedural",
     "prcdrl",
@@ -1637,123 +1448,94 @@ DUPLICATE_GENERIC_NAME_TOKENS = {
     "materials",
 }
 
-
 def remove_known_suffix(filename: str) -> str:
     lower_name = filename.lower()
     suffix = archive_suffix(Path(filename))
-
     if suffix:
         return filename[: -len(suffix)]
-
     return filename[: -len(Path(lower_name).suffix)] if Path(lower_name).suffix else filename
-
 
 def normalize_duplicate_key(file_path: Path) -> str:
     name = remove_known_suffix(file_path.name).lower()
     name = re.sub(r"[\[\]{}()]+", " ", name)
     name = VERSION_EXTRACT_RE.sub(" ", name)
-
     for pattern in VERSION_PATTERNS:
         name = re.sub(pattern, " ", name, flags=re.IGNORECASE)
-
     name = re.sub(r"[_+\-.]+", " ", name)
     name = re.sub(r"\b(?:x64|x86|win64|win32|windows|macos|linux)\b", " ", name)
     name = re.sub(r"\s+", " ", name).strip()
-
     if not name:
         return remove_known_suffix(file_path.name).lower().strip()
-
     return name
-
 
 def duplicate_extension_key(file_path: Path) -> str:
     if archive_suffix(file_path):
         return "<archive>"
-
     return file_path.suffix.lower()
-
 
 def duplicate_similarity(left: str, right: str) -> float:
     if left == right:
         return 1.0
-
     ratio = SequenceMatcher(None, left, right).ratio()
     left_tokens = set(left.split())
     right_tokens = set(right.split())
-
     if not left_tokens or not right_tokens:
         return ratio
-
     shorter_tokens = left_tokens if len(left_tokens) <= len(right_tokens) else right_tokens
     longer_tokens = right_tokens if len(left_tokens) <= len(right_tokens) else left_tokens
-
     if len(shorter_tokens) >= 2 and shorter_tokens <= longer_tokens:
         return 0.92
-
     jaccard = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
     return max(ratio, jaccard)
-
 
 def compact_duplicate_name(file_path: Path) -> str:
     name = remove_known_suffix(file_path.name).lower()
     name = VERSION_EXTRACT_RE.sub(" ", name)
     for pattern in VERSION_PATTERNS:
         name = re.sub(pattern, " ", name, flags=re.IGNORECASE)
-
     compact = re.sub(r"[^a-z0-9]+", "", name)
     compact = COMPACT_VERSION_RE.sub("", compact)
-
     for token in COMPACT_DROP_WORDS:
         compact = compact.replace(token, "")
-
     return compact
-
 
 def compact_duplicate_skeleton(compact: str) -> str:
     return re.sub(r"[aeiouy]+", "", compact)
 
-
 def duplicate_containment_is_weak(
-    left_key: str,
-    right_key: str,
-    left_compact: str,
-    right_compact: str,
+        left_key: str,
+        right_key: str,
+        left_compact: str,
+        right_compact: str,
 ) -> bool:
     if left_compact == right_compact:
         return False
-
     if len(left_compact) <= len(right_compact):
         shorter_key = left_key
         longer_key = right_key
     else:
         shorter_key = right_key
         longer_key = left_key
-
     shorter_tokens = shorter_key.split()
     longer_tokens = longer_key.split()
-
     return len(shorter_tokens) == 1 and len(longer_tokens) > 1
-
 
 def duplicate_files_look_related(left: Path, right: Path) -> bool:
     left_key = normalize_duplicate_key(left)
     right_key = normalize_duplicate_key(right)
-
     if duplicate_similarity(left_key, right_key) >= DUPLICATE_SIMILARITY_THRESHOLD:
         return True
 
     left_compact = compact_duplicate_name(left)
     right_compact = compact_duplicate_name(right)
-
     if not left_compact or not right_compact:
         return False
 
     shorter_compact = left_compact if len(left_compact) <= len(right_compact) else right_compact
-
     if (
-        shorter_compact not in DUPLICATE_GENERIC_NAME_TOKENS
-        and not duplicate_containment_is_weak(left_key, right_key, left_compact, right_compact)
-        and (left_compact in right_compact or right_compact in left_compact)
+            shorter_compact not in DUPLICATE_GENERIC_NAME_TOKENS
+            and not duplicate_containment_is_weak(left_key, right_key, left_compact, right_compact)
+            and (left_compact in right_compact or right_compact in left_compact)
     ):
         return True
 
@@ -1762,44 +1544,36 @@ def duplicate_files_look_related(left: Path, right: Path) -> bool:
 
     left_skeleton = compact_duplicate_skeleton(left_compact)
     right_skeleton = compact_duplicate_skeleton(right_compact)
-
     if len(left_skeleton) < 4 or len(right_skeleton) < 4:
         return False
 
     shorter_skeleton = left_skeleton if len(left_skeleton) <= len(right_skeleton) else right_skeleton
-
     if (
-        shorter_skeleton not in DUPLICATE_GENERIC_NAME_TOKENS
-        and not duplicate_containment_is_weak(left_key, right_key, left_compact, right_compact)
-        and (left_skeleton in right_skeleton or right_skeleton in left_skeleton)
+            shorter_skeleton not in DUPLICATE_GENERIC_NAME_TOKENS
+            and not duplicate_containment_is_weak(left_key, right_key, left_compact, right_compact)
+            and (left_skeleton in right_skeleton or right_skeleton in left_skeleton)
     ):
         return True
 
     return SequenceMatcher(None, left_skeleton, right_skeleton).ratio() >= 0.86
 
-
 def archive_structure_token(value: str) -> str:
     spaced = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", value)
     name = remove_known_suffix(Path(spaced).name).lower()
     name = VERSION_EXTRACT_RE.sub(" ", name)
-
     for pattern in VERSION_PATTERNS:
         name = re.sub(pattern, " ", name, flags=re.IGNORECASE)
-
     return re.sub(r"[^a-z0-9]+", "", name)
 
-
 def archive_structure_signature(
-    file_path: Path,
-    cache: dict[Path, ArchiveStructureSignature | None],
+        file_path: Path,
+        cache: dict[Path, ArchiveStructureSignature | None],
 ) -> ArchiveStructureSignature | None:
     if file_path in cache:
         return cache[file_path]
-
     if not archive_suffix(file_path):
         cache[file_path] = None
         return None
-
     try:
         entry_details, _total_entries, _truncated = read_archive_entry_details(file_path)
     except Exception:
@@ -1807,12 +1581,12 @@ def archive_structure_signature(
         return None
 
     entries = [entry.path for entry in entry_details]
-
     if not entries:
         cache[file_path] = None
         return None
 
     classification, _reason = classify_archive_entries(entries)
+
     roots: set[str] = set()
     key_names: set[str] = set()
     suffixes: set[str] = set()
@@ -1821,17 +1595,14 @@ def archive_structure_signature(
         parts = entry.split("/")
         root_source = parts[0] if len(parts) > 1 else Path(parts[0]).stem
         root = archive_structure_token(root_source)
-
         if root:
             roots.add(root)
 
         detail = ArchiveEntryDetail(path=entry)
         name = archive_structure_token(Path(entry).name)
         suffix = Path(entry).suffix.lower()
-
         if suffix:
             suffixes.add(suffix)
-
         if name and archive_detail_key_file(detail):
             key_names.add(name)
 
@@ -1845,49 +1616,38 @@ def archive_structure_signature(
     cache[file_path] = signature
     return signature
 
-
 def archive_signatures_look_related(
-    left: ArchiveStructureSignature,
-    right: ArchiveStructureSignature,
+        left: ArchiveStructureSignature,
+        right: ArchiveStructureSignature,
 ) -> bool:
     if left.classification and right.classification and left.classification != right.classification:
         return False
-
     if left.roots & right.roots:
         return True
-
     if left.key_names & right.key_names:
         return True
-
     for left_root in left.roots:
         for right_root in right.roots:
             if SequenceMatcher(None, left_root, right_root).ratio() >= DUPLICATE_SIMILARITY_THRESHOLD:
                 return True
-
     for left_name in left.key_names:
         for right_name in right.key_names:
             if SequenceMatcher(None, left_name, right_name).ratio() >= DUPLICATE_SIMILARITY_THRESHOLD:
                 return True
-
-    if not left.roots and not right.roots and not left.key_names and not right.key_names:
+    if not left.roots and not right.roots and not left.key_names and not left.key_names:
         return bool(left.suffixes & right.suffixes)
-
     return False
 
-
 def archive_structure_allows_auto_add(
-    candidate_path: Path,
-    group_paths: list[Path],
-    cache: dict[Path, ArchiveStructureSignature | None],
+        candidate_path: Path,
+        group_paths: list[Path],
+        cache: dict[Path, ArchiveStructureSignature | None],
 ) -> bool:
     if not archive_suffix(candidate_path):
         return True
-
     candidate_signature = archive_structure_signature(candidate_path, cache)
-
     if candidate_signature is None:
         return True
-
     group_archive_signatures = [
         signature
         for path in group_paths
@@ -1895,20 +1655,17 @@ def archive_structure_allows_auto_add(
         for signature in [archive_structure_signature(path, cache)]
         if signature is not None
     ]
-
     if not group_archive_signatures:
         return True
-
     return any(
         archive_signatures_look_related(candidate_signature, signature)
         for signature in group_archive_signatures
     )
 
-
 def archive_structure_components(
-    archive_ids: list[int],
-    id_to_path: dict[int, Path],
-    cache: dict[Path, ArchiveStructureSignature | None],
+        archive_ids: list[int],
+        id_to_path: dict[int, Path],
+        cache: dict[Path, ArchiveStructureSignature | None],
 ) -> list[set[int]]:
     signatures = {
         file_id: signature
@@ -1916,8 +1673,8 @@ def archive_structure_components(
         for signature in [archive_structure_signature(id_to_path[file_id], cache)]
         if signature is not None
     }
-    components: list[set[int]] = []
 
+    components: list[set[int]] = []
     for file_id in signatures:
         matching_indexes = [
             index
@@ -1927,24 +1684,19 @@ def archive_structure_components(
                 for member_id in component
             )
         ]
-
         if not matching_indexes:
             components.append({file_id})
             continue
-
         first_index = matching_indexes[0]
         components[first_index].add(file_id)
-
         for index in reversed(matching_indexes[1:]):
             components[first_index].update(components[index])
             del components[index]
-
     return components
 
-
 def split_llm_duplicate_groups_by_archive_structure(
-    groups: list[dict],
-    id_to_path: dict[int, Path],
+        groups: list[dict],
+        id_to_path: dict[int, Path],
 ) -> list[dict]:
     split_groups: list[dict] = []
     archive_signature_cache: dict[Path, ArchiveStructureSignature | None] = {}
@@ -1956,13 +1708,13 @@ def split_llm_duplicate_groups_by_archive_structure(
             for file_id in candidate_ids
             if file_id in id_to_path and archive_suffix(id_to_path[file_id])
         ]
-
         if len(archive_ids) < 2:
             split_groups.append(group)
             continue
 
         components = archive_structure_components(archive_ids, id_to_path, archive_signature_cache)
         multi_components = [component for component in components if len(component) >= 2]
+
         llm_duplicate_log(
             "archive_structure_components",
             group=group,
@@ -1973,7 +1725,6 @@ def split_llm_duplicate_groups_by_archive_structure(
         if len(components) <= 1:
             split_groups.append(group)
             continue
-
         if not multi_components:
             continue
 
@@ -1983,7 +1734,6 @@ def split_llm_duplicate_groups_by_archive_structure(
                 key=lambda file_id: duplicate_file_score(id_to_path[file_id]),
             )
             delete_ids = sorted(file_id for file_id in component if file_id != keep_id)
-
             if not delete_ids:
                 continue
 
@@ -1994,13 +1744,13 @@ def split_llm_duplicate_groups_by_archive_structure(
                 kept_component=sorted(component),
                 removed_ids=removed_ids,
             )
+
             removed_text = (
                 "; исключены по структуре архива: "
                 + ", ".join(f"[{file_id}] {id_to_path[file_id].name}" for file_id in removed_ids)
                 if removed_ids
                 else ""
             )
-
             split_groups.append(
                 {
                     **group,
@@ -2010,56 +1760,39 @@ def split_llm_duplicate_groups_by_archive_structure(
                     "reason": f"{group['reason']}{removed_text}",
                 }
             )
-
     return split_groups
-
 
 def compact_version_tuple(name: str) -> tuple[int, ...] | None:
     compact = re.sub(r"[^a-z0-9]+", "", name.lower())
     match = COMPACT_VERSION_RE.search(compact)
-
     if not match:
         return None
-
     return tuple(int(digit) for digit in match.group(1))
-
 
 def normalize_version_tuple(version: tuple[int, ...] | None) -> tuple[int, ...]:
     if not version:
         return ()
-
     normalized = tuple(version)
-
     while normalized and normalized[-1] == 0:
         normalized = normalized[:-1]
-
     return normalized
-
 
 def duplicate_version_tuple(file_path: Path) -> tuple[int, ...] | None:
     name = remove_known_suffix(file_path.name).lower()
     explicit_matches = list(EXPLICIT_VERSION_EXTRACT_RE.finditer(name))
     matches = explicit_matches or list(VERSION_EXTRACT_RE.finditer(name))
-
     best: tuple[int, ...] | None = None
-
     for match in matches:
         raw = match.group(1)
         parts = re.findall(r"\d+", raw)
-
         if not parts:
             continue
-
         version = tuple(int(part) for part in parts)
-
         if best is None or version > best:
             best = version
-
     if best is not None:
         return best
-
     return compact_version_tuple(name)
-
 
 def duplicate_modified_day(file_path: Path) -> str:
     try:
@@ -2067,40 +1800,29 @@ def duplicate_modified_day(file_path: Path) -> str:
     except OSError:
         return "0000-00-00"
 
-
 def duplicate_file_score(file_path: Path) -> tuple[tuple[int, ...], str, int]:
     version = normalize_version_tuple(duplicate_version_tuple(file_path))
-
     try:
         size = file_path.stat().st_size
     except OSError:
         size = 0
-
     return version, duplicate_modified_day(file_path), size
-
 
 def format_version_tuple(version: tuple[int, ...] | None) -> str:
     if not version:
         return "-"
-
     return ".".join(str(part) for part in version)
-
 
 def format_duplicate_version(file_path: Path) -> str:
     raw_version = duplicate_version_tuple(file_path)
     comparable_version = normalize_version_tuple(raw_version)
-
     if not raw_version:
         return "-"
-
     raw_text = format_version_tuple(raw_version)
     comparable_text = format_version_tuple(comparable_version)
-
     if raw_text == comparable_text:
         return raw_text
-
     return f"{raw_text} (= {comparable_text})"
-
 
 def suggest_duplicate_keep(group: list[Path]) -> tuple[int, list[int], str]:
     scored = [(i, file_path, duplicate_file_score(file_path)) for i, file_path in enumerate(group, 1)]
@@ -2108,7 +1830,6 @@ def suggest_duplicate_keep(group: list[Path]) -> tuple[int, list[int], str]:
     delete_indexes = [i for i, _, _ in scored if i != keep_index]
 
     versions = [score[0] for _, _, score in scored if score[0]]
-
     if versions and len(set(versions)) > 1:
         reason = (
             f"оставить более новую версию {format_version_tuple(keep_score[0])}: "
@@ -2116,42 +1837,34 @@ def suggest_duplicate_keep(group: list[Path]) -> tuple[int, list[int], str]:
         )
     else:
         days = [score[1] for _, _, score in scored]
-
         if len(set(days)) > 1:
             reason = f"версии одинаковы/не найдены, оставить более свежий файл: {keep_path.name}"
         else:
             reason = f"дата модификации в один день, оставить файл большего размера: {keep_path.name}"
-
     return keep_index, delete_indexes, reason
-
 
 def find_duplicate_groups(files: list[Path]) -> list[list[Path]]:
     buckets: dict[str, list[tuple[str, Path]]] = {}
-
     for file_path in files:
         key = duplicate_extension_key(file_path)
         buckets.setdefault(key, []).append((normalize_duplicate_key(file_path), file_path))
 
     groups: list[list[Path]] = []
-
     for items in buckets.values():
         pending = items[:]
-
         while pending:
             key, file_path = pending.pop(0)
             group = [(key, file_path)]
             changed = True
-
             while changed:
                 changed = False
                 rest: list[tuple[str, Path]] = []
                 group_keys = [item_key for item_key, _ in group]
-
                 for candidate_key, candidate_path in pending:
                     if any(
-                        duplicate_similarity(candidate_key, group_key)
-                        >= DUPLICATE_SIMILARITY_THRESHOLD
-                        for group_key in group_keys
+                            duplicate_similarity(candidate_key, group_key)
+                            >= DUPLICATE_SIMILARITY_THRESHOLD
+                            for group_key in group_keys
                     ) or any(
                         duplicate_files_look_related(candidate_path, group_path)
                         for _, group_path in group
@@ -2160,9 +1873,7 @@ def find_duplicate_groups(files: list[Path]) -> list[list[Path]]:
                         changed = True
                     else:
                         rest.append((candidate_key, candidate_path))
-
                 pending = rest
-
             if len(group) > 1:
                 paths = sorted(
                     [path for _, path in group],
@@ -2173,17 +1884,14 @@ def find_duplicate_groups(files: list[Path]) -> list[list[Path]]:
                     ),
                 )
                 groups.append(paths)
-
     groups.sort(key=lambda group: (len(group), group[0].name.lower()), reverse=True)
     return groups
-
 
 def format_mtime(file_path: Path) -> str:
     try:
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(file_path.stat().st_mtime))
     except OSError:
         return "unknown"
-
 
 def print_duplicate_group(group: list[Path], index: int, total: int) -> None:
     common_key = normalize_duplicate_key(group[0])
@@ -2193,121 +1901,93 @@ def print_duplicate_group(group: list[Path], index: int, total: int) -> None:
     print(f"  Дубли/версии: группа {index}/{total}")
     print(f"  Ключ         : {common_key}")
     print(f"{hr('═')}")
-
     for i, file_path in enumerate(group, 1):
         try:
             size = format_size(file_path.stat().st_size)
         except OSError:
             size = "unknown"
-
         print(
             f"  [{i:>2}] {file_path.name}\n"
             f"       size: {size} | modified: {format_mtime(file_path)} | "
             f"version: {format_duplicate_version(file_path)} | "
             f"key: {normalize_duplicate_key(file_path)}"
         )
-
     delete_arg = " ".join(str(index) for index in delete_indexes)
-    print(f"\n  [suggest] d {delete_arg}")
+    print(f"\n[suggest] d {delete_arg}")
     print(f"        └─ {reason}")
     print(f"        └─ Быстро применить: a")
 
-
 def parse_duplicate_numbers(raw: str, max_index: int) -> list[int]:
     numbers: list[int] = []
-
     for token in re.split(r"[,\s]+", raw.strip()):
         if not token:
             continue
-
         if not token.isdigit():
             return []
-
         value = int(token)
-
         if value < 1 or value > max_index:
             return []
-
         if value not in numbers:
             numbers.append(value)
-
     return numbers
-
 
 def duplicate_review_dir(root: Path) -> Path:
     return root / DUPLICATE_REVIEW_FOLDER
 
-
 def move_duplicate_files(root: Path, files: list[Path]) -> int:
     review_dir = duplicate_review_dir(root)
     moved = 0
-
     try:
         review_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         print(f"  [ОШИБКА] Не удалось создать {review_dir}: {e}")
         return 0
-
     for file_path in files:
         if not file_path.exists():
             continue
-
         dest_path = resolve_destination(review_dir, file_path.name)
-
         try:
             shutil.move(str(file_path), str(dest_path))
             print(f"  [✓] Перемещено: {file_path.name} → {DUPLICATE_REVIEW_FOLDER}/{dest_path.name}")
             moved += 1
         except OSError as e:
             print(f"  [ОШИБКА] {file_path.name}: {e}")
-
     return moved
-
 
 def _legacy_delete_duplicate_files_unused(files: list[Path], root: Path | None = None) -> int:
     deleted = 0
-
     for file_path in files:
         if not file_path.exists():
             continue
-
         try:
             send2trash(str(file_path))
             print(f"  [✓] Удалено: {file_path.name}")
             deleted += 1
         except Exception as e:
             print(f"  [ОШИБКА] {file_path.name}: {e}")
-
     return deleted
-
 
 def delete_duplicate_files(files: list[Path], root: Path | None = None) -> int:
     deleted = 0
-
     for file_path in files:
         if not file_path.exists():
             continue
-
         try:
             send2trash(str(file_path))
             print(f"  [ok] В корзину: {file_path.name}")
             deleted += 1
         except Exception as e:
             print(f"  [!] Не удалось отправить в корзину: {file_path.name}: {e}")
-
             if root:
                 print(f"  [dup] Перемещаю в {DUPLICATE_REVIEW_FOLDER}/ вместо безвозвратного удаления.")
                 deleted += move_duplicate_files(root, [file_path])
             else:
                 print("  [dup] Файл оставлен на месте.")
-
     return deleted
-
 
 def parse_json_object_response(raw: str) -> dict | None:
     if not raw:
         return None
-
     text = raw.strip()
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"```json\s*", "", text, flags=re.IGNORECASE)
@@ -2317,36 +1997,27 @@ def parse_json_object_response(raw: str) -> dict | None:
 
     decoder = json.JSONDecoder()
     idx = 0
-
     while idx < len(text):
         brace_idx = text.find("{", idx)
-
         if brace_idx == -1:
             break
-
         try:
             obj, end = decoder.raw_decode(text[brace_idx:])
         except json.JSONDecodeError:
             idx = brace_idx + 1
             continue
-
         if isinstance(obj, dict):
             return obj
-
         idx = brace_idx + max(end, 1)
-
     return None
-
 
 def duplicate_file_record(file_id: int, file_path: Path) -> dict:
     try:
         size_bytes = file_path.stat().st_size
     except OSError:
         size_bytes = 0
-
     version = duplicate_version_tuple(file_path)
     comparable_version = normalize_version_tuple(version)
-
     return {
         "id": file_id,
         "name": file_path.name,
@@ -2359,12 +2030,10 @@ def duplicate_file_record(file_id: int, file_path: Path) -> dict:
         "comparable_version": format_version_tuple(comparable_version),
     }
 
-
 def build_llm_duplicate_prompt(files: list[Path]) -> tuple[str, dict[int, Path]]:
     id_to_path = {i: file_path for i, file_path in enumerate(files, 1)}
     records = [duplicate_file_record(i, file_path) for i, file_path in id_to_path.items()]
     lines = []
-
     for record in records:
         lines.append(
             (
@@ -2375,10 +2044,8 @@ def build_llm_duplicate_prompt(files: list[Path]) -> tuple[str, dict[int, Path]]
                 f"key={record['normalized_key']}"
             )
         )
-
     prompt = "\n".join(lines)
     return prompt, id_to_path
-
 
 def duplicate_hint_tokens(file_path: Path) -> list[str]:
     spaced_name = re.sub(r"(?<=[a-zа-яё])(?=[A-ZА-ЯЁ])", " ", remove_known_suffix(file_path.name))
@@ -2389,7 +2056,6 @@ def duplicate_hint_tokens(file_path: Path) -> list[str]:
         for token in re.findall(r"[a-zа-яё0-9]+", key.lower())
         if len(token) >= 4
     ]
-
     stop_words = {
         "setup",
         "installer",
@@ -2409,18 +2075,13 @@ def duplicate_hint_tokens(file_path: Path) -> list[str]:
         "procedural",
     }
     tokens = [token for token in tokens if token not in stop_words]
-
     if compact and len(compact) >= 5:
         tokens.append(compact)
-
     skeleton = compact_duplicate_skeleton(compact)
-
     if len(skeleton) >= 5:
         tokens.append(skeleton)
-
     tokens = [token for token in tokens if token not in stop_words]
     return list(dict.fromkeys(tokens))
-
 
 def multipart_archive_part(file_path: Path) -> tuple[str, str] | None:
     name = file_path.name.lower()
@@ -2433,50 +2094,35 @@ def multipart_archive_part(file_path: Path) -> tuple[str, str] | None:
         r"(.+?)(?:[._ -])(\d{3})$",
     )
     match = None
-
     for pattern in patterns:
         match = re.search(pattern, name, flags=re.IGNORECASE)
-
         if match:
             break
-
     if not match:
         return None
-
     base = re.sub(r"[\W_]+", " ", match.group(1)).strip()
     number = str(int(match.group(2)))
     return base, number
 
-
 def all_same_multipart_set(ids: list[int], id_to_path: dict[int, Path]) -> bool:
     parts = [multipart_archive_part(id_to_path[file_id]) for file_id in ids]
-
     if not parts or any(part is None for part in parts):
         return False
-
     bases = {part[0] for part in parts if part is not None}
     numbers = {part[1] for part in parts if part is not None}
-
     return len(bases) == 1 and len(numbers) == len(ids)
-
 
 def group_contains_multipart_set_parts(ids: list[int], id_to_path: dict[int, Path]) -> bool:
     by_base: dict[str, set[str]] = {}
-
     for file_id in ids:
         if file_id not in id_to_path:
             continue
-
         part = multipart_archive_part(id_to_path[file_id])
-
         if not part:
             continue
-
         base, number = part
         by_base.setdefault(base, set()).add(number)
-
     return any(len(numbers) > 1 for numbers in by_base.values())
-
 
 def build_llm_duplicate_hints(id_to_path: dict[int, Path]) -> str:
     hint_groups: list[tuple[str, list[int], str]] = []
@@ -2484,32 +2130,25 @@ def build_llm_duplicate_hints(id_to_path: dict[int, Path]) -> str:
 
     def add_hint(label: str, ids: list[int], source: str) -> None:
         clean_ids = sorted(dict.fromkeys(file_id for file_id in ids if file_id in id_to_path))
-
         if len(clean_ids) < 2:
             return
-
         if all_same_multipart_set(clean_ids, id_to_path) or group_contains_multipart_set_parts(clean_ids, id_to_path):
             return
-
         signature = tuple(clean_ids)
-
         if signature in seen_signatures:
             return
-
         seen_signatures.add(signature)
         hint_groups.append((label, clean_ids, source))
 
     path_to_id = {file_path: file_id for file_id, file_path in id_to_path.items()}
-
     for group in find_duplicate_groups(list(id_to_path.values())):
         add_hint(
             normalize_duplicate_key(group[0]) or "local-similarity",
             [path_to_id[path] for path in group if path in path_to_id],
             "local_similarity",
-        )
+            )
 
     token_buckets: dict[str, list[int]] = {}
-
     for file_id, file_path in id_to_path.items():
         for token in duplicate_hint_tokens(file_path):
             token_buckets.setdefault(token, []).append(file_id)
@@ -2517,56 +2156,41 @@ def build_llm_duplicate_hints(id_to_path: dict[int, Path]) -> str:
     for token, ids in sorted(token_buckets.items(), key=lambda item: (-len(item[1]), item[0])):
         if len(ids) < 2:
             continue
-
         add_hint(token, ids, "shared_name_token")
 
     for left_id, left_path in id_to_path.items():
         related_ids = [left_id]
-
         for right_id, right_path in id_to_path.items():
             if right_id <= left_id:
                 continue
-
             if duplicate_files_look_related(left_path, right_path):
                 related_ids.append(right_id)
-
         if len(related_ids) > 1:
             add_hint(compact_duplicate_name(left_path) or normalize_duplicate_key(left_path), related_ids, "fallback_similarity")
 
     lines: list[str] = []
-
     for index, (label, ids, source) in enumerate(hint_groups[:LLM_DUPLICATE_MAX_HINT_GROUPS], 1):
         members = ", ".join(f"[{file_id}] {id_to_path[file_id].name}" for file_id in ids)
         lines.append(f"{index}. {label} | source={source} | ids={ids} | files={members}")
-
     return "\n".join(lines) if lines else "none"
-
 
 def parse_llm_rejected_duplicate_hints(data: dict) -> list[dict]:
     rejected: list[dict] = []
-
     for raw_item in data.get("rejected_hints", []):
         if not isinstance(raw_item, dict):
             continue
-
         ids: list[int] = []
-
         for value in raw_item.get("ids", []):
             try:
                 file_id = int(value)
             except Exception:
                 continue
-
             if file_id not in ids:
                 ids.append(file_id)
-
         reason = str(raw_item.get("reason", "")).strip()
-
         if ids and reason:
             rejected.append({"ids": ids, "reason": reason})
-
     return rejected
-
 
 def ask_llm_duplicate_groups(files: list[Path]) -> tuple[list[dict], dict[int, Path], list[dict]]:
     prompt, id_to_path = build_llm_duplicate_prompt(files)
@@ -2577,7 +2201,6 @@ def ask_llm_duplicate_groups(files: list[Path]) -> tuple[list[dict], dict[int, P
     system_prompt = f"""\
 You are a cautious duplicate-file review assistant.
 You receive files from one folder. Find possible duplicate files, older versions, renamed variants, or product-family version conflicts.
-
 Return ONLY one JSON object:
 {{
   "groups": [
@@ -2598,7 +2221,6 @@ Return ONLY one JSON object:
     }}
   ]
 }}
-
 Rules:
 1. Return review candidates, not automatic deletions. It is acceptable to include medium-confidence candidates for manual review.
 2. Extract and compare versions yourself from the filename. Do not rely only on detected_version; it is a weak hint.
@@ -2626,6 +2248,7 @@ Rules:
 """
 
     user_prompt = f"Files:\n{prompt}\n\nBroad candidate hints:\n{hints}"
+
     llm_duplicate_log(
         "initial_llm_request",
         system_prompt=system_prompt,
@@ -2639,7 +2262,6 @@ Rules:
             {"role": "user", "content": user_prompt},
         ]
     )
-
     llm_duplicate_log("initial_llm_raw_response", raw=raw)
 
     if not raw:
@@ -2663,35 +2285,27 @@ Rules:
     for raw_group in data["groups"]:
         if not isinstance(raw_group, dict):
             continue
-
         try:
             keep_id = int(raw_group.get("keep"))
         except Exception:
             continue
-
         if keep_id not in id_to_path:
             continue
 
         delete_ids: list[int] = []
-
         for value in raw_group.get("delete", []):
             try:
                 file_id = int(value)
             except Exception:
                 continue
-
             if file_id == keep_id or file_id not in id_to_path or file_id in used_delete_ids:
                 continue
-
             if file_id not in delete_ids:
                 delete_ids.append(file_id)
-
         if not delete_ids:
             continue
-
         if group_contains_multipart_set_parts([keep_id, *delete_ids], id_to_path):
             continue
-
         used_delete_ids.update(delete_ids)
 
         try:
@@ -2711,41 +2325,33 @@ Rules:
                 "reason": str(raw_group.get("reason", "")).replace('"', "'").strip(),
             }
         )
-
         if len(groups) >= LLM_DUPLICATE_MAX_GROUPS:
             break
 
     llm_duplicate_log("initial_llm_validated_groups", groups=groups, rejected_hints=rejected_hints)
     return groups, id_to_path, rejected_hints
 
-
 def format_duplicate_archive_detail(file_id: int, file_path: Path) -> str:
     if not archive_suffix(file_path):
         return f"[{file_id}] {file_path.name}\narchive: no\n"
-
     info = inspect_archive(file_path)
-
     if not info.supported:
         return (
             f"[{file_id}] {file_path.name}\n"
             f"archive: yes\n"
             f"scan_error: {info.error}\n"
         )
-
     entries = "\n".join(f"  - {entry}" for entry in info.preview_entries)
     extension_counts: dict[str, int] = {}
-
     for entry in info.preview_entries:
         suffix = Path(entry).suffix.lower() or "<no_ext>"
         extension_counts[suffix] = extension_counts.get(suffix, 0) + 1
-
     ext_summary = ", ".join(
         f"{suffix}:{count}"
         for suffix, count in sorted(extension_counts.items(), key=lambda item: (-item[1], item[0]))
     )
     classification = info.classification or "unknown"
     reason = info.reason or "no strong deterministic signal"
-
     return (
         f"[{file_id}] {file_path.name}\n"
         f"archive: yes\n"
@@ -2757,53 +2363,39 @@ def format_duplicate_archive_detail(file_id: int, file_path: Path) -> str:
         f"sample_entries:\n{entries}\n"
     )
 
-
 def validate_llm_duplicate_groups(data: dict, id_to_path: dict[int, Path]) -> list[dict]:
     if not isinstance(data.get("groups"), list):
         return []
-
     groups: list[dict] = []
     used_delete_ids: set[int] = set()
-
     for raw_group in data["groups"]:
         if not isinstance(raw_group, dict):
             continue
-
         try:
             keep_id = int(raw_group.get("keep"))
         except Exception:
             continue
-
         if keep_id not in id_to_path:
             continue
-
         delete_ids: list[int] = []
-
         for value in raw_group.get("delete", []):
             try:
                 file_id = int(value)
             except Exception:
                 continue
-
             if file_id == keep_id or file_id not in id_to_path or file_id in used_delete_ids:
                 continue
-
             if file_id not in delete_ids:
                 delete_ids.append(file_id)
-
         if not delete_ids:
             continue
-
         if group_contains_multipart_set_parts([keep_id, *delete_ids], id_to_path):
             continue
-
         used_delete_ids.update(delete_ids)
-
         try:
             confidence = max(0.0, min(1.0, float(raw_group.get("confidence", 0.0))))
         except Exception:
             confidence = 0.0
-
         groups.append(
             {
                 "title": str(raw_group.get("title", "")).strip() or normalize_duplicate_key(id_to_path[keep_id]),
@@ -2816,12 +2408,9 @@ def validate_llm_duplicate_groups(data: dict, id_to_path: dict[int, Path]) -> li
                 "reason": str(raw_group.get("reason", "")).replace('"', "'").strip(),
             }
         )
-
         if len(groups) >= LLM_DUPLICATE_MAX_GROUPS:
             break
-
     return groups
-
 
 def expand_llm_duplicate_groups(groups: list[dict], id_to_path: dict[int, Path]) -> list[dict]:
     expanded: list[dict] = []
@@ -2836,16 +2425,13 @@ def expand_llm_duplicate_groups(groups: list[dict], id_to_path: dict[int, Path])
         for file_id, file_path in id_to_path.items():
             if file_id in related_ids:
                 continue
-
             if not archive_structure_allows_auto_add(file_path, group_paths, archive_signature_cache):
                 continue
-
             if any(duplicate_files_look_related(file_path, id_to_path[group_id]) for group_id in group_ids):
                 related_ids.add(file_id)
 
         if len(related_ids) < 2:
             continue
-
         if group_contains_multipart_set_parts(sorted(related_ids), id_to_path):
             continue
 
@@ -2859,14 +2445,11 @@ def expand_llm_duplicate_groups(groups: list[dict], id_to_path: dict[int, Path])
             for file_id in candidates
             if file_id != keep_id and file_id not in consumed_delete_ids
         ]
-
         if not delete_ids:
             continue
-
         consumed_delete_ids.update(delete_ids)
         added_ids = sorted(set(candidates) - set(group_ids))
         added_text = f"; добавлены похожие ID {added_ids}" if added_ids else ""
-
         expanded.append(
             {
                 **group,
@@ -2878,62 +2461,50 @@ def expand_llm_duplicate_groups(groups: list[dict], id_to_path: dict[int, Path])
                 "reason": f"{group['reason']}{added_text}",
             }
         )
-
     return expanded
-
 
 def group_file_ids(group: dict) -> set[int]:
     return {int(file_id) for file_id in [group["keep"], *group["delete"]]}
 
-
 def prune_duplicate_outlier_ids(
-    keep_id: int,
-    delete_ids: list[int],
-    id_to_path: dict[int, Path],
+        keep_id: int,
+        delete_ids: list[int],
+        id_to_path: dict[int, Path],
 ) -> tuple[list[int], list[int]]:
     keep_path = id_to_path[keep_id]
     kept_delete_ids: list[int] = []
     outlier_ids: list[int] = []
-
     for file_id in delete_ids:
         file_path = id_to_path[file_id]
-
         if duplicate_files_look_related(file_path, keep_path):
             kept_delete_ids.append(file_id)
         else:
             outlier_ids.append(file_id)
-
     return kept_delete_ids, outlier_ids
 
-
 def enforce_llm_duplicate_priority(
-    refined_groups: list[dict],
-    source_groups: list[dict],
-    id_to_path: dict[int, Path],
-    include_source_candidates: bool = False,
+        refined_groups: list[dict],
+        source_groups: list[dict],
+        id_to_path: dict[int, Path],
+        include_source_candidates: bool = False,
 ) -> list[dict]:
     fixed: list[dict] = []
     used_delete_ids: set[int] = set()
 
     for group in refined_groups:
         candidate_ids = group_file_ids(group)
-
         if include_source_candidates:
             for source_group in source_groups:
                 source_ids = group_file_ids(source_group)
-
                 if candidate_ids & source_ids:
                     candidate_ids |= source_ids
-
         candidate_ids = {
             file_id
             for file_id in candidate_ids
             if file_id in id_to_path and id_to_path[file_id].exists()
         }
-
         if len(candidate_ids) < 2:
             continue
-
         if group_contains_multipart_set_parts(sorted(candidate_ids), id_to_path):
             continue
 
@@ -2949,14 +2520,12 @@ def enforce_llm_duplicate_priority(
         ]
         original_delete_ids = delete_ids[:]
         delete_ids, outlier_ids = prune_duplicate_outlier_ids(keep_id, delete_ids, id_to_path)
-
         if not delete_ids and original_delete_ids:
             delete_ids = original_delete_ids
             outlier_ids = []
 
         used_delete_ids.update(delete_ids)
         reason = group["reason"]
-
         if group.get("structure_override", False):
             reason = (
                 f"{reason}; выбор LLM оставлен по deep-анализу структуры архива "
@@ -2967,7 +2536,6 @@ def enforce_llm_duplicate_priority(
                 f"{reason}; исправлено правилом приоритета: оставить "
                 f"{id_to_path[keep_id].name}, потому что у него выше версия/дата/размер по правилу выбора"
             )
-
         if outlier_ids:
             outlier_names = ", ".join(f"[{file_id}] {id_to_path[file_id].name}" for file_id in outlier_ids)
             reason = f"{reason}; исключены нерелевантные кандидаты: {outlier_names}"
@@ -2980,13 +2548,10 @@ def enforce_llm_duplicate_priority(
                 "reason": reason,
             }
         )
-
     return fixed
-
 
 def format_duplicate_rule_report(groups: list[dict], id_to_path: dict[int, Path]) -> str:
     reports: list[str] = []
-
     for index, group in enumerate(groups, 1):
         candidate_ids = sorted(group_file_ids(group))
         scored = [
@@ -2994,14 +2559,11 @@ def format_duplicate_rule_report(groups: list[dict], id_to_path: dict[int, Path]
             for file_id in candidate_ids
             if file_id in id_to_path and id_to_path[file_id].exists()
         ]
-
         if len(scored) < 2:
             continue
-
         keep_id, keep_path, keep_score = max(scored, key=lambda item: item[2])
         versions = [score[0] for _, _, score in scored if score[0]]
         days = [score[1] for _, _, score in scored]
-
         if versions and len(set(versions)) > 1:
             criterion = "newest comparable_version"
         elif len(set(days)) > 1:
@@ -3029,16 +2591,13 @@ def format_duplicate_rule_report(groups: list[dict], id_to_path: dict[int, Path]
                 ]
             )
         )
-
-    return "\n\n".join(reports)
-
+    return "\n".join(reports)
 
 def refine_llm_duplicate_groups_with_archives(
-    groups: list[dict],
-    id_to_path: dict[int, Path],
+        groups: list[dict],
+        id_to_path: dict[int, Path],
 ) -> list[dict]:
     involved_ids: list[int] = []
-
     for group in groups:
         for file_id in [group["keep"], *group["delete"]]:
             if file_id not in involved_ids:
@@ -3049,6 +2608,7 @@ def refine_llm_duplicate_groups_with_archives(
         for file_id in involved_ids
         if archive_suffix(id_to_path[file_id])
     ]
+
     has_fallback_added = any(group.get("fallback_added_ids") for group in groups)
 
     if not archive_ids and not has_fallback_added:
@@ -3056,7 +2616,6 @@ def refine_llm_duplicate_groups_with_archives(
 
     if archive_ids:
         print(f"  [LLM] Быстро читаю содержимое архивов кандидатов: {len(archive_ids)}")
-
     if has_fallback_added:
         print("  [LLM] Проверяю fallback-кандидатов по полному контексту группы...")
 
@@ -3067,7 +2626,9 @@ def refine_llm_duplicate_groups_with_archives(
         ensure_ascii=False,
         indent=2,
     )
+
     archive_details = format_duplicate_archives_deep_review(archive_ids, id_to_path)
+
     candidate_details = "\n".join(
         (
             f"[{record['id']}] {record['name']} | size={record['size']} "
@@ -3081,12 +2642,12 @@ def refine_llm_duplicate_groups_with_archives(
             for file_id in involved_ids
         )
     )
+
     rule_report = format_duplicate_rule_report(groups, id_to_path)
 
     system_prompt = f"""\
 You are a cautious duplicate-file review assistant.
 You already proposed duplicate groups. Now review them using candidate file details and detailed archive structure reports when available.
-
 Return ONLY one JSON object:
 {{
   "groups": [
@@ -3101,7 +2662,6 @@ Return ONLY one JSON object:
     }}
   ]
 }}
-
 Rules:
 1. Keep a group only if files are likely the same product/asset/tool or older/newer versions.
 2. If archive contents clearly differ in product type, ecosystem, or main files, omit that group.
@@ -3134,11 +2694,12 @@ Rules:
 """
 
     user_content = (
-        f"Original candidate groups:\n{original_groups}\n\n"
-        f"Candidate file details:\n{candidate_details}\n\n"
-        f"Weak local heuristic report (may be wrong about product versions):\n{rule_report}\n\n"
+        f"Original candidate groups:\n{original_groups}\n"
+        f"Candidate file details:\n{candidate_details}\n"
+        f"Weak local heuristic report (may be wrong about product versions):\n{rule_report}\n"
         f"Detailed archive structure reports:\n{archive_details}"
     )
+
     llm_duplicate_log(
         "archive_refine_llm_request",
         system_prompt=system_prompt,
@@ -3156,7 +2717,6 @@ Rules:
             {"role": "user", "content": user_content},
         ]
     )
-
     llm_duplicate_log("archive_refine_llm_raw_response", raw=raw)
 
     if not raw:
@@ -3180,10 +2740,8 @@ Rules:
     llm_duplicate_log("archive_refine_priority_enforced_groups", groups=fixed)
     return fixed
 
-
 def print_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], index: int, total: int) -> None:
     keep_path = id_to_path[group["keep"]]
-
     print(f"\n{hr('═')}")
     print(f"  LLM дубли: группа {index}/{total}")
     print(f"  Название : {group['title']}")
@@ -3196,7 +2754,6 @@ def print_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], index: i
         f"version: {format_duplicate_version(keep_path)}"
     )
     print("  К удалению:")
-
     for file_id in group["delete"]:
         file_path = id_to_path[file_id]
         print(
@@ -3205,45 +2762,32 @@ def print_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], index: i
             f"modified: {format_mtime(file_path)} | "
             f"version: {format_duplicate_version(file_path)}"
         )
-
     analysis = str(group.get("analysis", "")).strip()
-
     if analysis:
-        print("\n  Анализ LLM:")
-
+        print("\nАнализ LLM:")
         for line in analysis.splitlines():
             print(f"    {line}")
-
     print(f"  Причина: {group['reason']}")
-
 
 def print_rejected_duplicate_hints(rejected_hints: list[dict], id_to_path: dict[int, Path]) -> None:
     if not rejected_hints:
         return
-
-    print("\n  [dup-llm] Отклоненные широкие кандидаты:")
-
+    print("\n[dup-llm] Отклоненные широкие кандидаты:")
     for index, item in enumerate(rejected_hints, 1):
         ids = [file_id for file_id in item["ids"] if file_id in id_to_path]
-
         if not ids:
             continue
-
         names = ", ".join(f"[{file_id}] {id_to_path[file_id].name}" for file_id in ids)
         print(f"    {index}. {names}")
         print(f"       └─ {item['reason']}")
 
-
 def print_llm_keep_selection(group: dict, id_to_path: dict[int, Path]) -> None:
     keep_path = id_to_path[group["keep"]]
     delete_files = [id_to_path[file_id] for file_id in group["delete"] if id_to_path[file_id].exists()]
-
     print(f"  [dup] Теперь оставить: [{group['keep']}] {keep_path.name}")
     print("  [dup] Остальные по текущему выбору:")
-
     for file_path in delete_files:
         print(f"    - {file_path.name}")
-
 
 def apply_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], root: Path) -> tuple[str, int]:
     candidate_ids = sorted(group_file_ids(group))
@@ -3260,111 +2804,86 @@ def apply_llm_duplicate_group(group: dict, id_to_path: dict[int, Path], root: Pa
         if file_id not in candidate_ids or file_id not in id_to_path or not id_to_path[file_id].exists():
             print(f"  [!] ID {file_id} нет в этой группе или файл уже недоступен.")
             return False
-
         current_group["keep"] = file_id
         current_group["delete"] = [
             candidate_id
             for candidate_id in candidate_ids
             if candidate_id != file_id
-            and candidate_id in id_to_path
-            and id_to_path[candidate_id].exists()
+               and candidate_id in id_to_path
+               and id_to_path[candidate_id].exists()
         ]
         current_group["reason"] = f"выбор пользователя: оставить {id_to_path[file_id].name}"
         print_llm_keep_selection(current_group, id_to_path)
         return True
 
     print("  Команды: d=удалить предложенные, m=переместить предложенные, k ID=выбрать что оставить, km ID=выбрать и переместить остальные, s=пропустить, q=выйти")
-
     while True:
         delete_files = [
             id_to_path[file_id]
             for file_id in current_group["delete"]
             if file_id in id_to_path and id_to_path[file_id].exists()
         ]
-        choice = read_input("\n  duplicates_llm [d/m/k ID/km ID/s/q]> ").strip().lower()
-
+        choice = read_input("\nduplicates_llm [d/m/k ID/km ID/s/q]> ").strip().lower()
         if choice == "q":
             return "quit", 0
-
         if choice == "s":
             print("  [dup] Группа пропущена.")
             return "done", 0
-
         if choice.startswith("k ") or choice.startswith("keep "):
             parts = choice.split(maxsplit=1)
-
             if len(parts) != 2 or not parts[1].isdigit():
                 print("  [!] Формат: k ID")
                 continue
-
             set_manual_keep(int(parts[1]))
             continue
-
         if choice.startswith("km "):
             parts = choice.split(maxsplit=1)
-
             if len(parts) != 2 or not parts[1].isdigit():
                 print("  [!] Формат: km ID")
                 continue
-
             if not set_manual_keep(int(parts[1])):
                 continue
-
             delete_files = [
                 id_to_path[file_id]
                 for file_id in current_group["delete"]
                 if file_id in id_to_path and id_to_path[file_id].exists()
             ]
-
             if ask_yes_no(
-                f"  Переместить {len(delete_files)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
+                    f"  Переместить {len(delete_files)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
             ):
                 moved = move_duplicate_files(root, delete_files)
                 return ("done", 1) if moved else ("done", 0)
-
             continue
-
         if choice == "m":
             if ask_yes_no(
-                f"  Переместить {len(delete_files)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
+                    f"  Переместить {len(delete_files)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
             ):
                 moved = move_duplicate_files(root, delete_files)
                 return ("done", 1) if moved else ("done", 0)
-
             continue
-
         if choice == "d":
             print("  Будут удалены:")
-
             for file_path in delete_files:
                 print(f"    - {file_path.name}")
-
             if ask_yes_no("  Отправить предложенные LLM файлы в корзину? [y/n]: "):
                 deleted = delete_duplicate_files(delete_files, root)
                 return ("done", 1) if deleted else ("done", 0)
-
             continue
-
         print("  [!] Введите d, m, k ID, km ID, s или q.")
 
-
 def apply_duplicate_command(
-    choice: str,
-    group: list[Path],
-    root: Path,
+        choice: str,
+        group: list[Path],
+        root: Path,
 ) -> tuple[str, int]:
     choice = choice.strip().lower()
-
     if not choice:
         return "continue", 0
-
     if choice == "q":
         return "quit", 0
-
     if choice == "s":
         print("  [dup] Группа пропущена.")
         return "done", 0
-
     if choice == "a":
         _, delete_indexes, _ = suggest_duplicate_keep(group)
         choice = "d " + " ".join(str(index) for index in delete_indexes)
@@ -3375,224 +2894,192 @@ def apply_duplicate_command(
 
     if command == "k":
         numbers = parse_duplicate_numbers(args, len(group))
-
         if len(numbers) != 1:
             print("  [!] Формат: k N")
             return "continue", 0
-
         keep_index = numbers[0]
         selected = [
             file_path
             for i, file_path in enumerate(group, 1)
             if i != keep_index
         ]
-
         if not selected:
             print("  [!] Нечего перемещать.")
             return "continue", 0
-
         print(f"  Оставляем: {group[keep_index - 1].name}")
-
         if ask_yes_no(
-            f"  Переместить остальные {len(selected)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
+                f"  Переместить остальные {len(selected)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
         ):
             moved = move_duplicate_files(root, selected)
             return ("done", 1) if moved else ("continue", 0)
-
         return "continue", 0
 
     if command == "m":
         numbers = parse_duplicate_numbers(args, len(group))
-
         if not numbers:
             print("  [!] Формат: m N ...")
             return "continue", 0
-
         selected = [group[number - 1] for number in numbers]
-
         if ask_yes_no(
-            f"  Переместить выбранные {len(selected)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
+                f"  Переместить выбранные {len(selected)} файл(ов) в {DUPLICATE_REVIEW_FOLDER}/? [y/n]: "
         ):
             moved = move_duplicate_files(root, selected)
             return ("done", 1) if moved else ("continue", 0)
-
         return "continue", 0
 
     if command == "d":
         numbers = parse_duplicate_numbers(args, len(group))
-
         if not numbers:
             print("  [!] Формат: d N ...")
             return "continue", 0
-
         selected = [group[number - 1] for number in numbers]
         print("  Будут удалены:")
-
         for file_path in selected:
             print(f"    - {file_path.name}")
-
         if ask_yes_no("  Отправить выбранные файлы в корзину? [y/n]: "):
             deleted = delete_duplicate_files(selected, root)
             return ("done", 1) if deleted else ("continue", 0)
-
         return "continue", 0
 
     print("  [!] Неизвестная команда. Используйте k/m/d/s/q.")
     return "continue", 0
 
-
 # ─────────────────────────────────────────────
 #  Ввод
 # ─────────────────────────────────────────────
-
 _stdin_queue: queue.Queue[str | None] | None = None
 _stdin_reader_started = False
 _stdin_reader_lock = threading.Lock()
 
-
 def ensure_stdin_reader() -> queue.Queue[str | None]:
     global _stdin_queue, _stdin_reader_started
-
     if _stdin_queue is None:
         _stdin_queue = queue.Queue()
-
-    if os.name != "nt":
-        return _stdin_queue
-
-    with _stdin_reader_lock:
-        if _stdin_reader_started:
+        if os.name != "nt":
             return _stdin_queue
+        with _stdin_reader_lock:
+            if _stdin_reader_started:
+                return _stdin_queue
 
-        def reader() -> None:
-            while True:
-                try:
-                    line = sys.stdin.readline()
-                except UnicodeDecodeError:
+            def reader() -> None:
+                while True:
                     try:
-                        raw_line = sys.stdin.buffer.readline()
+                        line = sys.stdin.readline()
+                    except UnicodeDecodeError:
+                        try:
+                            raw_line = sys.stdin.buffer.readline()
+                        except Exception:
+                            _stdin_queue.put(None)
+                            break
+                        if raw_line == b"":
+                            _stdin_queue.put(None)
+                            break
+                        line = raw_line.decode("utf-8", errors="replace")
                     except Exception:
                         _stdin_queue.put(None)
                         break
-
-                    if raw_line == b"":
+                    if line == "":
                         _stdin_queue.put(None)
                         break
+                    _stdin_queue.put(line.rstrip("\r\n"))
 
-                    line = raw_line.decode("utf-8", errors="replace")
-                except Exception:
-                    _stdin_queue.put(None)
-                    break
-
-                if line == "":
-                    _stdin_queue.put(None)
-                    break
-
-                _stdin_queue.put(line.rstrip("\r\n"))
-
-        thread = threading.Thread(target=reader, name="stdin-reader", daemon=True)
-        thread.start()
-        _stdin_reader_started = True
-
+            thread = threading.Thread(target=reader, name="stdin-reader", daemon=True)
+            thread.start()
+            _stdin_reader_started = True
     return _stdin_queue
-
 
 def read_input(prompt: str = "") -> str:
     if os.name != "nt":
         return input(prompt)
-
     stdin_queue = ensure_stdin_reader()
     print(prompt, end="", flush=True)
     line = stdin_queue.get()
-
     if line is None:
         try:
             return input()
         except UnicodeDecodeError:
             raw_line = sys.stdin.buffer.readline()
-
             if raw_line == b"":
                 raise EOFError
-
             return raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-
     return line
-
 
 def read_input_timeout(prompt: str, timeout_seconds: float) -> str | None:
     if os.name != "nt":
         import select
-
         print(prompt, end="", flush=True)
         ready, _, _ = select.select([sys.stdin], [], [], timeout_seconds)
-
         if ready:
             return sys.stdin.readline().strip()
-
         return None
 
     stdin_queue = ensure_stdin_reader()
     print(prompt, end="", flush=True)
-
     try:
         line = stdin_queue.get(timeout=timeout_seconds)
     except queue.Empty:
         return None
-
     if line is None:
         raise EOFError
-
     return line
 
+def read_input_poll(timeout_seconds: float = 0.0) -> str | None:
+    if os.name != "nt":
+        import select
+        ready, _, _ = select.select([sys.stdin], [], [], timeout_seconds)
+        if ready:
+            return sys.stdin.readline().strip().lower()
+        return None
+
+    stdin_queue = ensure_stdin_reader()
+    try:
+        line = stdin_queue.get(timeout=max(0.0, timeout_seconds))
+    except queue.Empty:
+        return None
+    if line is None:
+        raise EOFError
+    return line.strip().lower()
+
+def read_pending_input_nowait() -> str | None:
+    return read_input_poll(0.0)
+
+def drain_pending_inputs(values: set[str]) -> None:
+    while True:
+        line = read_pending_input_nowait()
+        if line is None:
+            return
+        if line not in values:
+            start_sort_log("pending_input_drained_unexpected", input=line)
+            return
 
 def timed_choice(
-    prompt: str,
-    timeout_seconds: int,
-    default: str,
-    valid_choices: set[str],
+        prompt: str,
+        timeout_seconds: int,
+        default: str,
+        valid_choices: set[str],
 ) -> tuple[str, bool]:
     """
     Меню с таймаутом.
-
-    Поведение:
-    - 1/2/3/4/5/0/s/q вводятся через Enter.
-    - -1 поддерживается для удаления.
-    - Enter отменяет таймер и переводит выбор в ручной режим.
-    - Если ничего не нажато до таймаута, возвращается default.
-
-    Возвращает:
-      (choice, timed_out)
-
-    Спец-значение:
-      "__manual__" = пользователь нажал Enter, нужно спросить обычным input без таймера.
     """
-
     if timeout_seconds <= 0:
         choice = read_input(prompt).strip().lower()
         return choice, False
 
     choice = read_input_timeout(prompt, timeout_seconds)
-
     if choice is None:
         print()
         return default, True
-
     choice = choice.strip().lower()
-
     if choice == "":
         return "__manual__", False
-
     return choice, False
-
 
 # ─────────────────────────────────────────────
 #  LLM интеграция
 # ─────────────────────────────────────────────
-
 SYSTEM_PROMPT = """\
 You are a precise file organization assistant. Your only job is to suggest which existing folder a given file should be moved to.
-
 Return ONLY one valid JSON object. No markdown. No comments. No explanations outside JSON.
-
 STRICT JSON schema:
 {
   "recommendations": [
@@ -3604,7 +3091,6 @@ STRICT JSON schema:
     }
   ]
 }
-
 GENERAL RULES:
 1. List up to 5 folders. Return 5 folders whenever at least 5 plausible existing folders are available.
 2. Sort by confidence descending.
@@ -3617,7 +3103,6 @@ GENERAL RULES:
 9. Suggest a new folder only if no existing folder is suitable.
 10. "reason" must be short Russian text.
 11. Do not use double quotes inside the reason string.
-
 SELECTION LOGIC:
 12. Prefer the most specific semantically matching existing folder over generic folders.
 13. Prefer domain-specific folders over generic folders.
@@ -3635,7 +3120,6 @@ SELECTION LOGIC:
 25. If filename suggests templates, starter projects, samples, demo projects, prefer template/project folders.
 26. If filename suggests materials, shaders, textures, surfaces, prefer materials/textures folders.
 27. If confidence between a specific folder and generic folder is close, choose the specific folder.
-
 EVIDENCE PRIORITY:
 28. Read the filename first. The filename often contains product name, ecosystem, content type, and version.
 29. Use Archive quick scan second, as confirmation or clarification when filename is ambiguous.
@@ -3643,7 +3127,6 @@ EVIDENCE PRIORITY:
 31. Dominant internal file extensions are medium evidence: .uasset, .blend, textures, .jsx/.zxp/.ccx.
 32. Do not let generic internal folders such as assets, content, source, textures override an explicit ecosystem or product type in the filename.
 33. If filename and archive contents conflict, prefer hard manifest files; otherwise prefer filename and mention the conflict in reason.
-
 IMPORTANT:
 34. Known standalone VFX/DCC tools and generators must not be classified as UE assets unless the filename explicitly contains UE/Unreal markers.
 35. EmberGen, EmbrGen, LiquiGen, GeoGen, Houdini, Blender, Maya, ZBrush, Substance, Marvelous Designer, World Creator, Gaea, SpeedTree are standalone software/tools unless filename explicitly says they are UE/Unreal assets or plugins.
@@ -3665,36 +3148,28 @@ GENERIC_FOLDER_TOKENS = {
     "files",
 }
 
-
 def is_generic_folder(folder: str) -> bool:
     normalized = normalize_rel_folder(folder)
     if not normalized:
         return True
-
     parts = re.split(r"[/_\-\s]+", normalized.lower())
     return any(part in GENERIC_FOLDER_TOKENS for part in parts)
-
 
 def apply_generic_folder_penalty(recs: list[dict]) -> list[dict]:
     """
     Штрафует generic/unsorted папки.
-    Они должны побеждать только если других нормальных вариантов нет.
     """
     if not recs:
         return recs
-
     has_specific = any(not is_generic_folder(r["folder"]) for r in recs)
-
     for r in recs:
         if is_generic_folder(r["folder"]):
             if has_specific:
                 r["confidence"] = min(float(r["confidence"]), 0.34)
             else:
                 r["confidence"] = min(float(r["confidence"]), 0.45)
-
     recs.sort(key=lambda x: x["confidence"], reverse=True)
     return recs
-
 
 def prepare_recommendations_for_choice(recs: list[dict]) -> tuple[list[dict], int | None]:
     filtered = [
@@ -3702,25 +3177,18 @@ def prepare_recommendations_for_choice(recs: list[dict]) -> tuple[list[dict], in
         for r in recs
         if float(r.get("confidence", 0.0)) >= MIN_RECOMMENDATION_CONFIDENCE
     ]
-
     if not filtered and recs:
         filtered = [recs[0]]
-
     filtered.sort(key=lambda x: x["confidence"], reverse=True)
-
     if len(filtered) >= 2:
         lead_gap = float(filtered[0]["confidence"]) - float(filtered[1]["confidence"])
-
         if lead_gap > STRONG_LEAD_CONFIDENCE_GAP:
             return [filtered[0]], STRONG_LEAD_AUTO_SELECT_SECONDS
-
     return filtered[:MAX_RECOMMENDATIONS], None
-
 
 # ─────────────────────────────────────────────
 #  Deterministic override: standalone VFX/DCC tools
 # ─────────────────────────────────────────────
-
 STANDALONE_TOOL_KEYWORDS = {
     "embergen",
     "embrgen",
@@ -3740,7 +3208,6 @@ STANDALONE_TOOL_KEYWORDS = {
     "speedtree",
 }
 
-
 ENGINE_MARKERS = {
     "ue",
     "ue4",
@@ -3750,94 +3217,64 @@ ENGINE_MARKERS = {
     "blender",
 }
 
-
 def normalize_filename_tokens(filename: str) -> list[str]:
     name = filename.lower()
     name = re.sub(r"[_\-.+()\[\]]+", " ", name)
     return [p for p in name.split() if p]
 
-
 def filename_contains_engine_marker(filename: str) -> bool:
     tokens = normalize_filename_tokens(filename)
     joined = " ".join(tokens)
-
-    # UE54, UE55, UE56, UE57, UE5.6, UE_5_6 и похожие варианты
     if re.search(r"\bue\s*5?\s*\d+", joined):
         return True
-
     if re.search(r"\bue[45]?\d*\b", joined):
         return True
-
     if "unreal" in tokens:
         return True
-
     if "unity" in tokens:
         return True
-
     return False
-
 
 def filename_contains_standalone_tool(filename: str) -> bool:
     name = filename.lower().replace("_", " ").replace("-", " ")
-
     compact = re.sub(r"[^a-z0-9]+", "", name)
-
     for keyword in STANDALONE_TOOL_KEYWORDS:
         compact_keyword = re.sub(r"[^a-z0-9]+", "", keyword.lower())
-
         if compact_keyword and compact_keyword in compact:
             return True
-
     return False
 
-
 def find_best_existing_folder_by_keywords(
-    flat_paths: list[str],
-    preferred_tokens: list[str],
-    forbidden_tokens: list[str] | None = None,
+        flat_paths: list[str],
+        preferred_tokens: list[str],
+        forbidden_tokens: list[str] | None = None,
 ) -> str | None:
     forbidden_tokens = forbidden_tokens or []
-
     best_path: str | None = None
     best_score = -1
-
     for path in flat_paths:
         path_low = path.lower()
-
         if any(token.lower() in path_low for token in forbidden_tokens):
             continue
-
         score = 0
-
         for token in preferred_tokens:
             if token.lower() in path_low:
                 score += 10
-
-        # Чем короче путь, тем лучше для общей категории Software.
         score -= path_low.count("/")
-
         if score > best_score:
             best_score = score
             best_path = path
-
     if best_score <= 0:
         return None
-
     return best_path
 
-
 def apply_standalone_tool_override(
-    filename: str,
-    recs: list[dict],
-    flat_paths: list[str],
+        filename: str,
+        recs: list[dict],
+        flat_paths: list[str],
 ) -> list[dict]:
-    """
-    Если файл похож на standalone software/tool, а явного UE/Unreal маркера нет,
-    не позволяем LLM отправить его в UE_Assets.
-    """
     if not filename_contains_standalone_tool(filename):
         return recs
-
     if filename_contains_engine_marker(filename):
         return recs
 
@@ -3846,33 +3283,26 @@ def apply_standalone_tool_override(
         preferred_tokens=["software", "tools", "apps", "programs", "program", "софт"],
         forbidden_tokens=["plugins", "plugin"],
     )
-
     if not software_folder:
         software_folder = find_best_existing_folder_by_keywords(
             flat_paths=flat_paths,
             preferred_tokens=["software"],
         )
-
     if not software_folder:
         return recs
 
-    # Убираем явно плохие UE asset guesses.
     filtered: list[dict] = []
-
     for r in recs:
         folder_low = r["folder"].lower()
-
         is_bad_engine_asset_guess = (
-            "ue/" in folder_low or folder_low.startswith("ue")
-        ) and (
-            "asset" in folder_low
-            or "environment" in folder_low
-            or "template" in folder_low
-        )
-
+                                            "ue/" in folder_low or folder_low.startswith("ue")
+                                    ) and (
+                                            "asset" in folder_low
+                                            or "environment" in folder_low
+                                            or "template" in folder_low
+                                    )
         if is_bad_engine_asset_guess:
             continue
-
         filtered.append(r)
 
     override = {
@@ -3881,28 +3311,22 @@ def apply_standalone_tool_override(
         "confidence": 0.95,
         "reason": "Похоже на standalone VFX/DCC инструмент, а не на UE ассет",
     }
-
     result = [override]
-
     for r in filtered:
         if r["folder"] != software_folder:
             result.append(r)
-
     result.sort(key=lambda x: x["confidence"], reverse=True)
-
     return result[:MAX_RECOMMENDATIONS]
 
-
 def apply_archive_override(
-    archive_info: ArchiveInspection | None,
-    recs: list[dict],
-    flat_paths: list[str],
+        archive_info: ArchiveInspection | None,
+        recs: list[dict],
+        flat_paths: list[str],
 ) -> list[dict]:
     if not archive_info or not archive_info.classification:
         return recs
 
     classification = archive_info.classification
-
     if classification == "blender_addon":
         folder = find_best_existing_folder_by_keywords(
             flat_paths=flat_paths,
@@ -3971,26 +3395,20 @@ def apply_archive_override(
         "confidence": 0.98,
         "reason": reason,
     }
-
     result = [override]
-
     for r in recs:
         if r["folder"] != folder:
             result.append(r)
-
     result.sort(key=lambda x: x["confidence"], reverse=True)
     return result[:MAX_RECOMMENDATIONS]
-
 
 def format_archive_for_prompt(archive_info: ArchiveInspection | None) -> str:
     if not archive_info or not archive_info.inspected:
         return ""
-
     if not archive_info.supported:
         return f"\nArchive quick scan: failed: {archive_info.error}\n"
 
     signals: list[str] = []
-
     if archive_info.has_init_py:
         signals.append("__init__.py")
     if archive_info.has_blend:
@@ -4005,7 +3423,6 @@ def format_archive_for_prompt(archive_info: ArchiveInspection | None) -> str:
     entries = "\n".join(f"- {entry}" for entry in archive_info.preview_entries)
     classification = archive_info.classification or "unknown"
     reason = archive_info.reason or "no strong deterministic signal"
-
     return (
         f"\nArchive quick scan:\n"
         f"  Type              : {archive_info.archive_type}\n"
@@ -4017,18 +3434,16 @@ def format_archive_for_prompt(archive_info: ArchiveInspection | None) -> str:
         f"  Sample entries:\n{entries}\n"
     )
 
-
 def build_user_message(
-    filename: str,
-    extension: str,
-    size_bytes: int,
-    tree_str: str,
-    flat_paths: list[str],
-    excluded: list[str] | None = None,
-    archive_info: ArchiveInspection | None = None,
+        filename: str,
+        extension: str,
+        size_bytes: int,
+        tree_str: str,
+        flat_paths: list[str],
+        excluded: list[str] | None = None,
+        archive_info: ArchiveInspection | None = None,
 ) -> str:
     excl_block = ""
-
     if excluded:
         excl_list = "\n".join(f"- {e}" for e in excluded)
         excl_block = (
@@ -4056,7 +3471,6 @@ def build_user_message(
         f"Only suggest a new folder if none of the existing folder paths are suitable.\n"
     )
 
-
 def call_llm_raw(messages: list[dict]) -> str | None:
     payload = {
         "model": MODEL_NAME,
@@ -4064,106 +3478,61 @@ def call_llm_raw(messages: list[dict]) -> str | None:
         "temperature": TEMPERATURE,
         "max_tokens": MAX_TOKENS,
         "stream": False,
-        # JSON Mode для совместимых llama.cpp / LM Studio серверов.
-        # Если сервер не поддерживает response_format, ниже будет fallback.
         "response_format": {"type": "json_object"},
     }
-
     try:
         resp = requests.post(LLAMACPP_URL, json=payload, timeout=REQUEST_TIMEOUT)
-
-        # Fallback для серверов без response_format.
         if resp.status_code >= 400:
             payload.pop("response_format", None)
             resp = requests.post(LLAMACPP_URL, json=payload, timeout=REQUEST_TIMEOUT)
-
         resp.raise_for_status()
-
         data = resp.json()
         message = data["choices"][0]["message"]
-
         content = message.get("content", "")
         reasoning = message.get("reasoning_content", "")
-
-        # Критично:
-        # Не склеиваем reasoning_content и content.
-        # Иначе JSON часто ломается из-за промежуточных рассуждений.
         if content and content.strip():
             return content.strip()
-
-        # Fallback только если сервер почему-то положил финальный ответ в reasoning_content.
         if reasoning and reasoning.strip():
             return reasoning.strip()
-
         return None
-
     except Exception as e:
         print(f"  [ОШИБКА API LLM]: {e}")
         return None
 
-
 def parse_llm_response(raw: str) -> dict | None:
-    """
-    Надежный парсер JSON:
-    - убирает think-блоки;
-    - убирает markdown fences;
-    - не берет текст от первой { до последней };
-    - ищет первый валидный JSON-объект с ключом recommendations.
-    """
     if not raw:
         return None
-
     text = raw.strip()
-
-    # Удаляем reasoning-блоки, если модель все равно вывела их в content.
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(
         r"<\|channel>thought.*?<channel\|>", "", text, flags=re.DOTALL | re.IGNORECASE
     )
-
-    # Удаляем markdown code fence.
     text = re.sub(r"```json\s*", "", text, flags=re.IGNORECASE)
     text = text.replace("```", "")
-
-    # Удаляем висячие запятые перед ] или }.
     text = re.sub(r",\s*([\]}])", r"\1", text)
 
     decoder = json.JSONDecoder()
-
     for candidate in (text, repair_json_like_text(text)):
         idx = 0
-
         while idx < len(candidate):
             brace_idx = candidate.find("{", idx)
-
             if brace_idx == -1:
                 break
-
             try:
                 obj, end = decoder.raw_decode(candidate[brace_idx:])
             except json.JSONDecodeError:
                 idx = brace_idx + 1
                 continue
-
             if isinstance(obj, dict) and isinstance(obj.get("recommendations"), list):
                 return obj
-
             idx = brace_idx + max(end, 1)
-
     print(
         "  [ОШИБКА] В ответе LLM не найден валидный JSON-объект с ключом 'recommendations'."
     )
     print(f"  [DEBUG RAW]:\n{text[:1000]}...\n")
-
     return None
 
-
 def repair_json_like_text(text: str) -> str:
-    """
-    Чинит частые мелкие ошибки локальных моделей в JSON:
-    - confidence: 0.4 -> "confidence": 0.4
-    - reason": "..." -> "reason": "..."
-    """
     text = re.sub(
         r"(?m)([{,]\s*)(folder|exists|confidence|reason|recommendations)\s*:",
         r'\1"\2":',
@@ -4176,36 +3545,25 @@ def repair_json_like_text(text: str) -> str:
     )
     return text
 
-
 def validate_and_sort_recommendations(data: dict, flat_paths: list[str]) -> list[dict]:
     recs = data.get("recommendations", [])
-
     if not isinstance(recs, list):
         return []
-
     flat_set = {p for p in (normalize_rel_folder(path) for path in flat_paths) if p}
-
     seen: set[str] = set()
     result: list[dict] = []
-
     for r in recs:
         if not isinstance(r, dict):
             continue
-
         folder = normalize_rel_folder(str(r.get("folder", "")))
-
         if not folder or folder in seen:
             continue
-
         seen.add(folder)
-
         try:
             confidence = max(0.0, min(1.0, float(r.get("confidence", 0.5))))
         except Exception:
             confidence = 0.5
-
         reason = str(r.get("reason", "")).replace('"', "'").strip()
-
         result.append(
             {
                 "folder": folder,
@@ -4214,19 +3572,16 @@ def validate_and_sort_recommendations(data: dict, flat_paths: list[str]) -> list
                 "reason": reason,
             }
         )
-
     result.sort(key=lambda x: x["confidence"], reverse=True)
     result = apply_generic_folder_penalty(result)
-
     return result[:MAX_RECOMMENDATIONS]
 
-
 def ask_llm(
-    file_path: Path,
-    tree_str: str,
-    flat_paths: list[str],
-    excluded: list[str] | None = None,
-    archive_info: ArchiveInspection | None = None,
+        file_path: Path,
+        tree_str: str,
+        flat_paths: list[str],
+        excluded: list[str] | None = None,
+        archive_info: ArchiveInspection | None = None,
 ) -> list[dict] | None:
     try:
         size = file_path.stat().st_size
@@ -4244,44 +3599,44 @@ def ask_llm(
             excluded=excluded_folders,
             archive_info=archive_info,
         )
-
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ]
-
+        start_sort_log(
+            "llm_request",
+            file=file_path,
+            excluded=excluded_folders or [],
+            user_prompt=user_msg,
+        )
         raw = call_llm_raw(messages)
-
+        start_sort_log("llm_raw_response", file=file_path, raw=raw)
         if not raw:
             print("  [ОШИБКА] LLM вернула пустой ответ или запрос упал.")
+            start_sort_log("llm_empty_response", file=file_path)
             return None
-
         data = parse_llm_response(raw)
-
+        start_sort_log("llm_parsed_json", file=file_path, data=data)
         if not data:
             return None
-
         recs = validate_and_sort_recommendations(data, flat_paths)
-
         if not recs:
             print(
                 "  [ОШИБКА] LLM выдала JSON, но он пуст или не содержит валидных recommendations."
             )
             print(f"  [DEBUG JSON]: {data}")
+            start_sort_log("llm_no_valid_recommendations", file=file_path, data=data)
             return None
-
         recs = apply_standalone_tool_override(
             filename=file_path.name,
             recs=recs,
             flat_paths=flat_paths,
         )
-
         recs = apply_archive_override(
             archive_info=archive_info,
             recs=recs,
             flat_paths=flat_paths,
         )
-
         if excluded_folders:
             excluded_set = {
                 path
@@ -4289,110 +3644,210 @@ def ask_llm(
                 if path
             }
             recs = [r for r in recs if r["folder"] not in excluded_set]
-
         recs = apply_generic_folder_penalty(recs)
+        start_sort_log(
+            "llm_recommendations",
+            file=file_path,
+            excluded=excluded_folders or [],
+            recommendations=recs,
+        )
         return recs
 
     recs = request_once(excluded)
-
     if not recs:
         print("  [ОШИБКА] LLM не вернула новых вариантов после исключения старых.")
         return None
 
     if len(recs) < MAX_RECOMMENDATIONS and len(flat_paths) > len(recs):
         refill_excluded = list(excluded or [])
-
         for r in recs:
             if r["folder"] not in refill_excluded:
                 refill_excluded.append(r["folder"])
-
         print("  [LLM] Добираю варианты до 5...", flush=True)
         extra_recs = request_once(refill_excluded)
-
         if extra_recs:
             seen = {r["folder"] for r in recs}
-
             for r in extra_recs:
                 if r["folder"] in seen:
                     continue
-
                 recs.append(r)
                 seen.add(r["folder"])
-
                 if len(recs) >= MAX_RECOMMENDATIONS:
                     break
-
-            recs = apply_generic_folder_penalty(recs)
-
+        recs = apply_generic_folder_penalty(recs)
+    start_sort_log("llm_final_recommendations", file=file_path, recommendations=recs)
     return recs
 
+def ask_llm_interruptible(
+        file_path: Path,
+        tree_str: str,
+        flat_paths: list[str],
+        archive_info: ArchiveInspection | None = None,
+) -> tuple[str, list[dict] | None]:
+    result_queue: queue.Queue[tuple[str, list[dict] | None]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            result_queue.put(("done", ask_llm(file_path, tree_str, flat_paths, archive_info=archive_info)))
+        except Exception as e:
+            start_sort_log("llm_worker_error", file=file_path, error=str(e))
+            result_queue.put(("done", None))
+
+    thread = threading.Thread(target=worker, name="start-llm-request", daemon=True)
+    thread.start()
+
+    while True:
+        pending = read_input_poll(0.2)
+        if pending in ("s", "skip"):
+            print("\n  [skip] Пропуск запрошен во время LLM-анализа.")
+            start_sort_log("skip_requested_during_llm", file=file_path, input=pending)
+            drain_pending_inputs({"s", "skip"})
+            return "skip", None
+        if pending in ("q", "quit", "exit"):
+            print("\n  [stop] Выход запрошен во время LLM-анализа.")
+            start_sort_log("quit_requested_during_llm", file=file_path, input=pending)
+            return "quit", None
+        if pending:
+            start_sort_log("pending_input_ignored_during_llm", file=file_path, input=pending)
+
+        try:
+            return result_queue.get_nowait()
+        except queue.Empty:
+            pass
 
 # ─────────────────────────────────────────────
 #  Операции с файлами
 # ─────────────────────────────────────────────
+def multipart_archive_parts(file_path: Path) -> list[Path]:
+    match = re.match(r"(?i)^(.+)\.part(\d+)\.rar$", file_path.name)
+    if not match:
+        return []
+    prefix = match.group(1)
+    pattern = re.compile(rf"(?i)^{re.escape(prefix)}\.part(\d+)\.rar$")
+    parts: list[tuple[int, Path]] = []
+    try:
+        for sibling in file_path.parent.glob(f"{prefix}.part*.rar"):
+            sibling_match = pattern.match(sibling.name)
+            if sibling_match and sibling.is_file():
+                parts.append((int(sibling_match.group(1)), sibling))
+    except OSError:
+        return []
+    return [path for _, path in sorted(parts, key=lambda item: item[0])]
 
+def is_multipart_archive_part(file_path: Path) -> bool:
+    return bool(re.match(r"(?i)^.+\.part\d+\.rar$", file_path.name))
+
+def verified_move_file(source: Path, destination: Path) -> None:
+    source_size = source.stat().st_size
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    if source.anchor.lower() == destination.anchor.lower():
+        source.rename(destination)
+        if not destination.exists() or destination.stat().st_size != source_size:
+            raise OSError(f"Проверка перемещения не пройдена: {destination}")
+        return
+
+    temp_path = destination.with_name(
+        f".{destination.name}.moving-{os.getpid()}-{int(time.time() * 1000)}.tmp"
+    )
+    counter = 1
+    while temp_path.exists():
+        temp_path = destination.with_name(
+            f".{destination.name}.moving-{os.getpid()}-{int(time.time() * 1000)}-{counter}.tmp"
+        )
+        counter += 1
+
+    try:
+        shutil.copy2(source, temp_path)
+        if not temp_path.exists() or temp_path.stat().st_size != source_size:
+            raise OSError(f"Проверка временной копии не пройдена: {temp_path}")
+        os.replace(temp_path, destination)
+        if not destination.exists() or destination.stat().st_size != source_size:
+            raise OSError(f"Проверка назначения не пройдена: {destination}")
+        source.unlink()
+    except Exception:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 def ask_yes_no(prompt: str) -> bool:
     while True:
         answer = read_input(prompt).strip().lower()
-
         if answer in ("y", "yes", "д", "да"):
             return True
-
         if answer in ("n", "no", "н", "нет"):
             return False
-
         print("  [!] Введите y/n.")
 
-
 def move_file(
-    file_path: Path,
-    dest_base: Path,
-    chosen_folder: str,
-    exists: bool,
-    *,
-    auto_confirm: bool = False,
-    auto_create_folder: bool = False,
+        file_path: Path,
+        dest_base: Path,
+        chosen_folder: str,
+        exists: bool,
+        *,
+        auto_confirm: bool = False,
+        auto_create_folder: bool = False,
 ) -> bool:
     normalized_folder = normalize_rel_folder(chosen_folder)
-
     if not normalized_folder:
         print(f"  [ОШИБКА] Некорректный путь папки: {chosen_folder}")
+        start_sort_log("move_rejected_invalid_folder", file=file_path, chosen_folder=chosen_folder)
         return False
-
     dest_dir = safe_join_base(dest_base, normalized_folder)
-
     if not dest_dir:
         print(f"  [ОШИБКА] Небезопасный путь папки: {chosen_folder}")
+        start_sort_log(
+            "move_rejected_unsafe_path",
+            file=file_path,
+            dest_base=dest_base,
+            chosen_folder=chosen_folder,
+        )
         return False
+
+    start_sort_log(
+        "move_attempt",
+        file=file_path,
+        dest_base=dest_base,
+        chosen_folder=chosen_folder,
+        normalized_folder=normalized_folder,
+        dest_dir=dest_dir,
+        folder_exists=dest_dir.exists(),
+        recommendation_exists=exists,
+        auto_confirm=auto_confirm,
+        auto_create_folder=auto_create_folder,
+    )
 
     if not dest_dir.exists():
         if not auto_create_folder:
             if not ask_yes_no(
-                f"\n  Папка '{normalized_folder}' не существует. Создать? [y/n]: "
+                    f"\nПапка '{normalized_folder}' не существует. Создать? [y/n]: "
             ):
                 print("  Отмена.")
+                start_sort_log("move_cancelled_create_folder", file=file_path, folder=normalized_folder)
                 return False
-
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
             print(f"  [✓] Папка создана: {normalized_folder}")
+            start_sort_log("folder_created", folder=normalized_folder, path=dest_dir)
         except OSError as e:
             print(f"  [ОШИБКА] {e}")
+            start_sort_log("folder_create_error", file=file_path, folder=normalized_folder, error=str(e))
             return False
 
     dest_path = resolve_destination(dest_dir, file_path.name)
-
     if dest_path.name != file_path.name:
         print(f"  [!] Файл переименован: {dest_path.name}")
 
     rel_output = f"{normalized_folder}/{dest_path.name}"
-
     if not auto_confirm:
         if not ask_yes_no(
-            f"\n  Переместить '{file_path.name}' → '{rel_output}'? [y/n]: "
+                f"\nПереместить '{file_path.name}' → '{rel_output}'? [y/n]: "
         ):
             print("  Отмена.")
+            start_sort_log("move_cancelled", file=file_path, destination=dest_path)
             return False
     else:
         print(
@@ -4400,78 +3855,85 @@ def move_file(
         )
 
     try:
-        shutil.move(str(file_path), str(dest_path))
+        source_size = file_path.stat().st_size
+        verified_move_file(file_path, dest_path)
         print(f"  [✓] Готово: {rel_output}")
+        start_sort_log(
+            "move_success",
+            source=file_path,
+            destination=dest_path,
+            relative_destination=rel_output,
+            size_bytes=source_size,
+            destination_exists=dest_path.exists(),
+            source_exists=file_path.exists(),
+            auto_confirm=auto_confirm,
+            auto_create_folder=auto_create_folder,
+        )
         return True
     except OSError as e:
         print(f"  [ОШИБКА] {e}")
+        start_sort_log(
+            "move_error",
+            source=file_path,
+            destination=dest_path,
+            source_exists=file_path.exists(),
+            destination_exists=dest_path.exists(),
+            error=str(e),
+        )
         return False
 
-
 def _confirm_delete(file_path: Path) -> bool:
+    start_sort_log("delete_prompt", file=file_path)
     if ask_yes_no(f"  Точно удалить '{file_path.name}'? [y/n]: "):
         try:
             send2trash(str(file_path))
             print("  [✓] Удален.")
+            start_sort_log("delete_success", file=file_path)
             return True
         except OSError as e:
             print(f"  [ОШИБКА] {e}")
-
+            start_sort_log("delete_error", file=file_path, error=str(e))
+            return False
+    start_sort_log("delete_cancelled", file=file_path)
     return False
-
 
 # ─────────────────────────────────────────────
 #  Команды CLI
 # ─────────────────────────────────────────────
-
-
 def _set_path(prompt_msg: str) -> Path | None:
     path_str = read_input(prompt_msg).strip()
-
     if not path_str:
         return None
-
     path = Path(path_str).expanduser().resolve()
-
     if not path.is_dir():
         print(f"  [!] Директория не существует или недоступна: {path}")
         return None
-
     return path
-
 
 def cmd_root() -> None:
     path = _set_path("  Путь к корневой папке источник файлов: ")
-
     if path:
         state.root = path
         state.tree_str, state.flat_paths = "", []
         save_config()
-
         print(f"  [✓] Источник root: {state.root}")
         print(f"  [✓] Сохранено в: {CONFIG_PATH}")
 
-
 def cmd_dest() -> None:
     path = _set_path("  Путь к папке назначения куда сортируем: ")
-
     if path:
         state.dest = path
         state.tree_str, state.flat_paths = "", []
         save_config()
-
         print(f"  [✓] Приемник dest: {state.dest}")
         print(f"  [✓] Сохранено в: {CONFIG_PATH}")
-
 
 def cmd_clear_dest() -> None:
     state.dest = None
     state.tree_str, state.flat_paths = "", []
     save_config()
-
     print("  [✓] dest очищен. Назначение теперь совпадает с root.")
     print(f"  [✓] Сохранено в: {CONFIG_PATH}")
-
 
 def cmd_timeout(args: list[str] | None = None) -> None:
     if not args:
@@ -4479,7 +3941,6 @@ def cmd_timeout(args: list[str] | None = None) -> None:
             print("  Текущий таймаут автовыбора: отключен")
         else:
             print(f"  Текущий таймаут автовыбора: {state.auto_select_seconds} сек")
-
         print()
         print("  Использование:")
         print("    timeout 60   — автовыбор через 60 секунд")
@@ -4488,32 +3949,25 @@ def cmd_timeout(args: list[str] | None = None) -> None:
         return
 
     raw = args[0].strip()
-
     try:
         value = int(raw)
     except ValueError:
         print(f"  [!] Некорректное значение таймаута: {raw}")
         return
-
     if value < 0:
         print("  [!] Таймаут не может быть меньше 0.")
         return
-
     state.auto_select_seconds = value
     save_config()
-
     if value == 0:
         print("  [✓] Автовыбор отключен.")
     else:
         print(f"  [✓] Таймаут автовыбора установлен: {value} сек")
-
-    print(f"  [✓] Сохранено в: {CONFIG_PATH}")
-
+        print(f"  [✓] Сохранено в: {CONFIG_PATH}")
 
 def cmd_folders() -> None:
     if not refresh_folder_cache():
         return
-
     if not state.flat_paths:
         print("  [!] В целевой директории нет подпапок.")
         print(f"\n{hr()}\n{state.tree_str}\n{hr()}")
@@ -4522,44 +3976,131 @@ def cmd_folders() -> None:
         print(f"  Папок: {len(state.flat_paths)}")
         print(hr())
 
+def cmd_extensions(args: list[str] | None = None) -> None:
+    if not args:
+        if state.include_extensions:
+            print(f"  Текущий фильтр расширений: {' '.join(sorted(state.include_extensions))}")
+        else:
+            print("  Фильтр расширений: отключен (показываются все файлы)")
+        print()
+        print("  Использование:")
+        print("    ext .zip .rar .7z    — показывать только эти расширения")
+        print("    ext clear            — сбросить фильтр")
+        return
+
+    if args[0].lower() == "clear":
+        state.include_extensions.clear()
+        save_config()
+        print("  [✓] Фильтр расширений сброшен. Показываются все файлы.")
+        print(f"  [✓] Сохранено в: {CONFIG_PATH}")
+        return
+
+    new_exts: set[str] = set()
+    for arg in args:
+        ext = arg.strip().lower()
+        if ext.startswith("."):
+            new_exts.add(ext)
+        else:
+            print(f"  [!] Пропущен '{arg}': расширение должно начинаться с точки, например .zip")
+
+    if not new_exts:
+        print("  [!] Не указано ни одного корректного расширения.")
+        return
+
+    state.include_extensions = new_exts
+    save_config()
+    print(f"  [✓] Установлен фильтр расширений: {' '.join(sorted(new_exts))}")
+    print(f"  [✓] Сохранено в: {CONFIG_PATH}")
+
+def cmd_sort(args: list[str] | None = None) -> None:
+    if not args:
+        print(f"  Текущая сортировка: {state.sort_by}")
+        print()
+        print("  Варианты:")
+        print("    sort name   — по имени (A→Z)")
+        print("    sort size   — по размеру (большие первые)")
+        print("    sort date   — по дате изменения (новые первые)")
+        print("    sort none   — без сортировки (как в папке)")
+        return
+
+    mode = args[0].strip().lower()
+    if mode not in ("name", "size", "date", "none"):
+        print(f"  [!] Неизвестный режим сортировки: {mode}")
+        return
+
+    state.sort_by = mode
+    save_config()
+    print(f"  [✓] Сортировка установлена: {mode}")
+    print(f"  [✓] Сохранено в: {CONFIG_PATH}")
 
 def cmd_start() -> None:
     if not state.root:
         print("  [!] Установите источник командой: root")
         return
-
     if not state.root.is_dir():
         print(f"  [!] root недоступен: {state.root}")
         return
-
     target_dir = state.target_dir
-
     if not target_dir:
         print("  [!] Не задана папка назначения.")
         return
-
     if not target_dir.is_dir():
         print(f"  [!] dest/root недоступен: {target_dir}")
         return
 
-    # Автосканирование при каждом start.
     if not refresh_folder_cache():
         return
 
-    while True:
-        files = get_files_in_root(state.root)
+    initial_files = get_files_in_root(state.root)
+    log_path = start_sort_session_log(state.root, target_dir, initial_files)
+    if log_path:
+        print(f"  [start-log] Лог сортировки: {log_path}")
 
+    skipped_files: set[str] = set()
+
+    def file_session_key(path: Path) -> str:
+        return str(path.resolve()).lower()
+
+    def mark_file_skipped(path: Path, mode: str) -> None:
+        skipped_files.add(file_session_key(path))
+        print("  Пропущено до конца текущего запуска start.")
+        start_sort_log(
+            "file_skipped",
+            file=path,
+            mode=mode,
+            skipped_count=len(skipped_files),
+        )
+
+    while True:
+        all_files = get_files_in_root(state.root)
+        files = [file for file in all_files if file_session_key(file) not in skipped_files]
         if not files:
-            print("\n  [✓] Все файлы в источнике root обработаны.")
+            if all_files:
+                print(f"\n[✓] Непропущенных файлов больше нет. Пропущено: {len(skipped_files)}")
+                start_sort_log(
+                    "session_finished",
+                    reason="all_remaining_files_skipped",
+                    skipped_count=len(skipped_files),
+                )
+            else:
+                print("\n[✓] Все файлы в источнике root обработаны.")
+                start_sort_log("session_finished", reason="no_files_left")
             break
 
         file_path = files[0]
-
         try:
             file_size = file_path.stat().st_size
         except OSError as e:
             print(f"  [ОШИБКА] Не удалось прочитать файл: {e}")
+            start_sort_log("file_stat_error", file=file_path, error=str(e))
             break
+
+        start_sort_log(
+            "file_begin",
+            file=file_path,
+            size_bytes=file_size,
+            remaining_count=len(files),
+        )
 
         print(
             f"\n{hr('═')}\n"
@@ -4570,11 +4111,25 @@ def cmd_start() -> None:
         )
 
         archive_info = inspect_archive(file_path)
+        start_sort_log("archive_inspection", file=file_path, archive_info=archive_info)
         print_archive_inspection(archive_info)
 
         print("  [LLM] Инференс: анализ файла и генерация рекомендаций...")
+        print("  [hint] Пока идет анализ, можно ввести s + Enter, чтобы сразу пропустить файл.")
+        llm_status, recs = ask_llm_interruptible(
+            file_path,
+            state.tree_str,
+            state.flat_paths,
+            archive_info=archive_info,
+        )
+        if llm_status == "skip":
+            mark_file_skipped(file_path, "during_llm_request")
+            continue
+        if llm_status == "quit":
+            start_sort_log("session_stopped_by_user", file=file_path, mode="during_llm_request")
+            return
+        start_sort_log("initial_recommendations", file=file_path, recommendations=recs)
 
-        recs = ask_llm(file_path, state.tree_str, state.flat_paths, archive_info=archive_info)
         show_full = recs is None
         manual_mode_for_file = False
         rejected_folders: list[str] = []
@@ -4583,7 +4138,6 @@ def cmd_start() -> None:
             if show_full:
                 _, current_paths = build_tree(target_dir, MAX_DEPTH)
                 current_paths = current_paths or state.flat_paths
-
                 if not current_paths:
                     print("  [!] Нет доступных папок для ручного выбора.")
                     choice = (
@@ -4591,19 +4145,16 @@ def cmd_start() -> None:
                         .strip()
                         .lower()
                     )
-
                     if choice == "q":
+                        start_sort_log("session_stopped_by_user", file=file_path, mode="manual_no_folders")
                         return
-
                     if choice == "s":
-                        print("  Пропущено.")
+                        mark_file_skipped(file_path, "manual_no_folders")
                         break
-
                     if choice == "-1":
                         if _confirm_delete(file_path):
                             break
-
-                    continue
+                        continue
 
                 print_tree_numbered(current_paths)
                 choice = (
@@ -4611,45 +4162,44 @@ def cmd_start() -> None:
                     .strip()
                     .lower()
                 )
-
                 if choice == "q":
+                    start_sort_log("session_stopped_by_user", file=file_path, mode="manual_folder_list")
                     return
-
                 if choice == "s":
-                    print("  Пропущено.")
+                    mark_file_skipped(file_path, "manual_folder_list")
                     break
-
                 if choice == "-1":
                     if _confirm_delete(file_path):
                         break
                     continue
-
                 if choice.isdigit() and 1 <= int(choice) <= len(current_paths):
                     folder = current_paths[int(choice) - 1]
-
+                    start_sort_log(
+                        "manual_folder_choice",
+                        file=file_path,
+                        choice=choice,
+                        folder=folder,
+                    )
                     if move_file(
-                        file_path,
-                        target_dir,
-                        folder,
-                        path_exists_in_base(target_dir, folder),
-                        auto_confirm=False,
-                        auto_create_folder=False,
+                            file_path,
+                            target_dir,
+                            folder,
+                            path_exists_in_base(target_dir, folder),
+                            auto_confirm=False,
+                            auto_create_folder=False,
                     ):
                         state.tree_str, state.flat_paths = build_tree(
                             target_dir, MAX_DEPTH
                         )
                         break
-
-                continue
+                    continue
 
             display_recs, forced_timeout = prepare_recommendations_for_choice(recs)
-
             if not display_recs:
                 show_full = True
                 continue
 
-            print("\n  Рекомендации LLM:")
-
+            print("\nРекомендации LLM:")
             if len(display_recs) < len(recs):
                 if forced_timeout is not None:
                     print(
@@ -4665,7 +4215,6 @@ def cmd_start() -> None:
                 filled = int(r["confidence"] * 10)
                 conf_bar = "█" * filled + "░" * (10 - filled)
                 status = "✓" if r["exists"] else "✚ новая"
-
                 print(
                     f"  [{i:>2}] {r['folder']}/  "
                     f"{conf_bar} {r['confidence']:.0%} │ {status}\n"
@@ -4674,24 +4223,21 @@ def cmd_start() -> None:
 
             valid_choices = {str(i) for i in range(1, len(display_recs) + 1)}
             valid_choices.update({"0", "-1", "s", "q"})
-            effective_timeout = forced_timeout or state.auto_select_seconds
 
+            effective_timeout = forced_timeout or state.auto_select_seconds
             if effective_timeout > 0 and not manual_mode_for_file:
                 prompt = (
-                    f"\n  Выбор [1-{len(display_recs)}], [0] другие, [-1] удалить, "
+                    f"\nВыбор [1-{len(display_recs)}], [0] другие, [-1] удалить, "
                     f"[s] пропустить, [q] выход "
                     f"(авто 1 через {effective_timeout} сек, Enter = ручной режим): "
                 )
-
                 choice, timed_out = timed_choice(
                     prompt=prompt,
                     timeout_seconds=effective_timeout,
                     default="1",
                     valid_choices=valid_choices,
                 )
-
                 choice = (choice or "").strip().lower()
-
                 if choice == "__manual__":
                     manual_mode_for_file = True
                     choice = (
@@ -4710,33 +4256,42 @@ def cmd_start() -> None:
                     print("  [auto] Таймаут. Выбрана рекомендация 1.")
             else:
                 prompt = (
-                    f"\n  Выбор [1-{len(display_recs)}], [0] другие, [-1] удалить, "
+                    f"\nВыбор [1-{len(display_recs)}], [0] другие, [-1] удалить, "
                     f"[s] пропустить, [q] выход: "
                 )
                 choice = read_input(prompt).strip().lower()
                 timed_out = False
 
+            start_sort_log(
+                "user_choice",
+                file=file_path,
+                choice=choice,
+                timed_out=timed_out,
+                displayed_recommendations=display_recs,
+            )
+
             if choice == "q":
+                start_sort_log("session_stopped_by_user", file=file_path, mode="recommendations")
                 return
-
             if choice == "s":
-                print("  Пропущено.")
+                mark_file_skipped(file_path, "recommendations")
                 break
-
             if choice == "-1":
                 if _confirm_delete(file_path):
                     break
                 continue
-
             if choice == "0":
                 for r in display_recs:
                     folder = r["folder"]
                     if folder not in rejected_folders:
                         rejected_folders.append(folder)
-
+                start_sort_log(
+                    "recommendations_rejected",
+                    file=file_path,
+                    rejected_folders=rejected_folders,
+                )
                 print("  [LLM] Текущие рекомендации отменены.", flush=True)
                 print("  [LLM] Запрашиваю другие варианты...", flush=True)
-
                 new_recs = ask_llm(
                     file_path,
                     state.tree_str,
@@ -4744,57 +4299,68 @@ def cmd_start() -> None:
                     excluded=rejected_folders,
                     archive_info=archive_info,
                 )
-
                 if new_recs:
                     recs = new_recs
                     show_full = False
                     continue
-
                 print("  [!] Других вариантов от LLM не получено. Открываю полный список папок.")
                 show_full = True
                 continue
 
             if choice.isdigit() and 1 <= int(choice) <= len(display_recs):
                 chosen = display_recs[int(choice) - 1]
-
+                if timed_out and is_multipart_archive_part(file_path):
+                    parts = multipart_archive_parts(file_path)
+                    print(
+                        "  [!] Это часть multipart RAR-архива. "
+                        "Автоперенос по таймауту заблокирован, нужен ручной выбор."
+                    )
+                    start_sort_log(
+                        "multipart_auto_move_blocked",
+                        file=file_path,
+                        chosen=chosen,
+                        parts=parts,
+                    )
+                    manual_mode_for_file = True
+                    continue
                 auto_confirm = bool(timed_out and AUTO_MOVE_WITHOUT_CONFIRMATION)
-
                 auto_create_folder = bool(timed_out and AUTO_CREATE_FOLDER_ON_TIMEOUT)
-
-                if move_file(
-                    file_path,
-                    target_dir,
-                    chosen["folder"],
-                    chosen["exists"],
+                start_sort_log(
+                    "recommendation_chosen",
+                    file=file_path,
+                    choice=choice,
+                    chosen=chosen,
+                    timed_out=timed_out,
                     auto_confirm=auto_confirm,
                     auto_create_folder=auto_create_folder,
+                )
+                if move_file(
+                        file_path,
+                        target_dir,
+                        chosen["folder"],
+                        chosen["exists"],
+                        auto_confirm=auto_confirm,
+                        auto_create_folder=auto_create_folder,
                 ):
                     state.tree_str, state.flat_paths = build_tree(target_dir, MAX_DEPTH)
                     break
-
                 continue
-
             print("  [!] Некорректный ввод.")
-
 
 def cmd_duplicates() -> None:
     if not state.root:
         print("  [!] Установите источник командой: root")
         return
-
     if not state.root.is_dir():
         print(f"  [!] root недоступен: {state.root}")
         return
-
     files = get_files_in_root(state.root)
-
     if not files:
         print("  [!] В root нет файлов для проверки.")
         return
 
     print(f"  [dup] Сканирую похожие имена в root: {state.root}")
     groups = find_duplicate_groups(files)
-
     if not groups:
         print("  [✓] Похожих дублей или версий не найдено.")
         return
@@ -4810,53 +4376,40 @@ def cmd_duplicates() -> None:
     print("  Предложение строится по правилам: версия → дата модификации → размер.")
 
     processed = 0
-
     for group_index, original_group in enumerate(groups, 1):
         group = [file_path for file_path in original_group if file_path.exists()]
-
         if len(group) < 2:
             continue
-
         while True:
             group = [file_path for file_path in group if file_path.exists()]
-
             if len(group) < 2:
                 break
-
             print_duplicate_group(group, group_index, len(groups))
-            choice = read_input("\n  duplicates> ").strip().lower()
+            choice = read_input("\nduplicates> ").strip().lower()
             status, processed_delta = apply_duplicate_command(
                 choice,
                 group,
                 state.root,
             )
             processed += processed_delta
-
             if status == "quit":
                 print(f"  [dup] Обработано групп: {processed}")
                 return
-
             if status == "done":
                 break
-
-    print(f"\n  [✓] Проверка дублей завершена. Обработано групп: {processed}")
-
+    print(f"\n[✓] Проверка дублей завершена. Обработано групп: {processed}")
 
 def cmd_duplicates_llm() -> None:
     if not state.root:
         print("  [!] Установите источник командой: root")
         return
-
     if not state.root.is_dir():
         print(f"  [!] root недоступен: {state.root}")
         return
-
     files = get_files_in_root(state.root)
-
     if not files:
         print("  [!] В root нет файлов для проверки.")
         return
-
     if len(files) > LLM_DUPLICATE_MAX_FILES:
         print(
             f"  [!] Файлов {len(files)}, в LLM будет отправлено только первых "
@@ -4865,7 +4418,6 @@ def cmd_duplicates_llm() -> None:
         files = files[:LLM_DUPLICATE_MAX_FILES]
 
     log_path = start_llm_duplicate_log(state.root, files)
-
     if log_path:
         print(f"  [dup-llm-log] Лог анализа: {log_path}")
 
@@ -4880,7 +4432,6 @@ def cmd_duplicates_llm() -> None:
 
     groups = expand_llm_duplicate_groups(groups, id_to_path)
     llm_duplicate_log("after_local_expand", groups=groups)
-
     if not groups:
         print("  [✓] После расширения похожих имён дубли не подтверждены.")
         print_rejected_duplicate_hints(rejected_hints, id_to_path)
@@ -4888,7 +4439,6 @@ def cmd_duplicates_llm() -> None:
 
     groups = split_llm_duplicate_groups_by_archive_structure(groups, id_to_path)
     llm_duplicate_log("after_archive_structure_split", groups=groups)
-
     if not groups:
         print("  [✓] После сравнения структуры архивов дубли не подтверждены.")
         print_rejected_duplicate_hints(rejected_hints, id_to_path)
@@ -4896,7 +4446,6 @@ def cmd_duplicates_llm() -> None:
 
     groups = refine_llm_duplicate_groups_with_archives(groups, id_to_path)
     llm_duplicate_log("after_archive_refine", groups=groups)
-
     if not groups:
         print("  [✓] После проверки содержимого архивов дубли не подтверждены.")
         print_rejected_duplicate_hints(rejected_hints, id_to_path)
@@ -4912,17 +4461,14 @@ def cmd_duplicates_llm() -> None:
     print("    q — выйти")
 
     processed = 0
-
     for group_index, group in enumerate(groups, 1):
         live_delete_ids = [
             file_id
             for file_id in group["delete"]
             if id_to_path[file_id].exists()
         ]
-
         if not id_to_path[group["keep"]].exists() or not live_delete_ids:
             continue
-
         group = {**group, "delete": live_delete_ids}
         llm_duplicate_log("shown_group", index=group_index, total=len(groups), group=group)
         print_llm_duplicate_group(group, id_to_path, group_index, len(groups))
@@ -4934,39 +4480,34 @@ def cmd_duplicates_llm() -> None:
             processed_delta=processed_delta,
         )
         processed += processed_delta
-
         if status == "quit":
             print(f"  [dup-llm] Обработано групп: {processed}")
             return
-
-    print(f"\n  [✓] LLM-проверка дублей завершена. Обработано групп: {processed}")
-
+    print(f"\n[✓] LLM-проверка дублей завершена. Обработано групп: {processed}")
 
 def cmd_status() -> None:
     print(f"\n{hr()}")
     print(f"  INI             : {CONFIG_PATH}")
     print(f"  Источник root   : {state.root or 'Не установлен'}")
     print(f"  Приемник dest   : {state.dest or 'Совпадает с root'}")
-
     if state.root and state.root.exists():
         print(f"  Файлов в root   : {len(get_files_in_root(state.root))}")
-
     target = state.target_dir
-
     if target:
         print(f"  Целевая папка   : {target}")
-
-    print(f"  Папок в кэше    : {len(state.flat_paths)}")
-
+        print(f"  Папок в кэше    : {len(state.flat_paths)}")
     if state.auto_select_seconds == 0:
         print("  Автовыбор       : отключен")
     else:
         print(f"  Автовыбор       : {state.auto_select_seconds} сек")
-
     print(f"  Автосоздание    : {'да' if AUTO_CREATE_FOLDER_ON_TIMEOUT else 'нет'}")
     print(f"  Автоперенос     : {'да' if AUTO_MOVE_WITHOUT_CONFIRMATION else 'нет'}")
+    if state.include_extensions:
+        print(f"  Фильтр ext      : {' '.join(sorted(state.include_extensions))}")
+    else:
+        print("  Фильтр ext      : отключен")
+    print(f"  Сортировка      : {state.sort_by}")
     print(hr())
-
 
 def cmd_help() -> None:
     print(
@@ -4979,12 +4520,17 @@ def cmd_help() -> None:
         f"  duplicates  — найти похожие файлы/версии в root\n"
         f"  duplicates_llm — LLM-поиск дублей с проверкой содержимого архивов\n"
         f"  timeout N   — изменить таймаут автовыбора, 0 = отключить\n"
+        f"  ext .zip .rar  — фильтр: обрабатывать только указанные расширения\n"
+        f"  ext clear      — сбросить фильтр расширений\n"
+        f"  sort size      — сортировка по размеру (большие первые)\n"
+        f"  sort date      — сортировка по дате (новые первые)\n"
+        f"  sort name      — сортировка по имени\n"
+        f"  sort none      — без сортировки\n"
         f"  status      — статус\n"
         f"  help        — помощь\n"
         f"  exit        — выход\n"
         f"{hr()}"
     )
-
 
 COMMANDS = {
     "root": cmd_root,
@@ -4996,51 +4542,47 @@ COMMANDS = {
     "duplicates_llm": cmd_duplicates_llm,
     "status": cmd_status,
     "help": cmd_help,
+    "ext": cmd_extensions,
+    "sort": cmd_sort,
 }
 
-
 def main() -> None:
-    print(f"\n{hr('═')}\n  File Sorter Assistant | Gemma 4 JSON Mode\n{hr('═')}")
-
+    print(f"\n{hr('═')}\nFile Sorter Assistant | Gemma 4 JSON Mode\n{hr('═')}")
     load_config()
 
     if state.root or state.dest:
         print("  [ini] Загружены сохраненные настройки:")
         print(f"        root   : {state.root or 'не установлен'}")
         print(f"        dest   : {state.dest or 'совпадает с root'}")
-
         if state.auto_select_seconds == 0:
             print("        timeout: отключен")
         else:
             print(f"        timeout: {state.auto_select_seconds} сек")
-
         print(f"        ini    : {CONFIG_PATH}")
 
     while True:
         try:
             line = read_input("\n> ").strip()
-
             if not line:
                 continue
-
             parts = line.split()
             cmd = parts[0].lower()
             args = parts[1:]
 
             if cmd in ("exit", "quit"):
                 break
-
             if cmd == "timeout":
                 cmd_timeout(args)
                 continue
 
             handler = COMMANDS.get(cmd)
-
             if handler:
-                handler()
+                if cmd in ("ext", "sort"):
+                    handler(args)
+                else:
+                    handler()
             else:
                 print("  [!] Неизвестная команда. Введите 'help'.")
-
         except KeyboardInterrupt:
             print()
             break
@@ -5048,7 +4590,6 @@ def main() -> None:
             print()
             print("  [!] Консоль закрыла поток ввода (EOF). Запустите в обычном терминале или включите stdin в IDE.")
             break
-
 
 if __name__ == "__main__":
     main()

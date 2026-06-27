@@ -175,8 +175,7 @@ source_dump.md
 /restored/
 
 /reports/
-/files_manager/llm_duplicate_logs/
+/files_manager/
 /outputs/
-/files_manager/file_sorter_assistant.ini
 /pytest.ini
 /config.yaml

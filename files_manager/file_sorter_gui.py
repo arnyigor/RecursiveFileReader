@@ -14,6 +14,7 @@ import configparser
 import os
 import shutil
 import sys
+import threading
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -617,38 +618,461 @@ class DuplicateReviewTab(QWidget):
         self.render_group(next_row)
 
 
+class SmartMoveSignals(QObject):
+    log = Signal(str)
+    status = Signal(str)
+    progress = Signal(int, int)
+    file_started = Signal(object)
+    recommendations_ready = Signal(object, object)
+    file_done = Signal(str)
+    error = Signal(str)
+    finished = Signal(bool)
+
+
+class SmartMoveWorker(QRunnable):
+    def __init__(
+        self,
+        root: Path,
+        dest: Path,
+        include_extensions: set[str],
+        sort_by: str,
+    ) -> None:
+        super().__init__()
+        self.root = root
+        self.dest = dest
+        self.include_extensions = include_extensions
+        self.sort_by = sort_by
+        self.signals = SmartMoveSignals()
+        self.cancelled = False
+        self.skip_requested = False
+        self._action_event = threading.Event()
+        self._action: dict | None = None
+        self._lock = threading.Lock()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self._action_event.set()
+
+    def skip_current(self) -> None:
+        self.skip_requested = True
+        self._action = {"type": "skip"}
+        self._action_event.set()
+
+    def choose_folder(self, folder: str) -> None:
+        with self._lock:
+            self._action = {"type": "move", "folder": folder}
+            self._action_event.set()
+
+    def files_to_process(self) -> list[Path]:
+        try:
+            files = [path for path in self.root.iterdir() if path.is_file() and not path.is_symlink()]
+        except OSError as e:
+            raise RuntimeError(f"Не удалось прочитать root: {e}") from e
+
+        if self.include_extensions:
+            files = [path for path in files if path.suffix.lower() in self.include_extensions]
+
+        if self.sort_by == "name":
+            files.sort(key=lambda path: path.name.lower())
+        elif self.sort_by == "size":
+            files.sort(key=lambda path: path.stat().st_size if path.exists() else 0, reverse=True)
+        elif self.sort_by == "date":
+            files.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+
+        return files
+
+    def wait_for_action(self) -> dict | None:
+        while not self.cancelled:
+            self._action_event.wait(0.2)
+            if self.cancelled:
+                return None
+            with self._lock:
+                if self._action is not None:
+                    action = self._action
+                    self._action = None
+                    self._action_event.clear()
+                    return action
+            self._action_event.clear()
+        return None
+
+    def move_to_folder(self, file_path: Path, folder: str) -> Path:
+        normalized = sorter.normalize_rel_folder(folder)
+        if not normalized:
+            raise RuntimeError("Некорректный путь папки назначения.")
+        dest_dir = sorter.safe_join_base(self.dest, normalized)
+        if not dest_dir:
+            raise RuntimeError("Небезопасный путь папки назначения.")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = sorter.resolve_destination(dest_dir, file_path.name)
+        sorter.verified_move_file(file_path, dest_path)
+        return dest_path
+
+    @Slot()
+    def run(self) -> None:
+        cancelled = False
+        try:
+            self.signals.status.emit("Сканирование папок назначения...")
+            tree_str, flat_paths = sorter.build_tree(self.dest, sorter.MAX_DEPTH)
+            files = self.files_to_process()
+            total = len(files)
+            self.signals.progress.emit(0, max(total, 1))
+            self.signals.log.emit(f"[start] Root: {self.root}")
+            self.signals.log.emit(f"[start] Dest: {self.dest}")
+            self.signals.log.emit(
+                "[start] Фильтр: "
+                + (" ".join(sorted(self.include_extensions)) if self.include_extensions else "все файлы")
+            )
+            self.signals.log.emit(f"[start] Сортировка: {self.sort_by}")
+            self.signals.log.emit(f"[scan] Найдено файлов: {total}; папок назначения: {len(flat_paths)}")
+
+            if not files:
+                self.signals.status.emit("Нет файлов для обработки.")
+                self.signals.finished.emit(False)
+                return
+
+            for index, file_path in enumerate(files, 1):
+                if self.cancelled:
+                    cancelled = True
+                    break
+                if not file_path.exists():
+                    self.signals.progress.emit(index, total)
+                    continue
+
+                self.skip_requested = False
+                size = file_path.stat().st_size
+                self.signals.file_started.emit(
+                    {
+                        "path": file_path,
+                        "name": file_path.name,
+                        "size": sorter.format_size(size),
+                        "index": index,
+                        "total": total,
+                    }
+                )
+                self.signals.status.emit(f"LLM анализ: {file_path.name}")
+                self.signals.log.emit(f"[file] {index}/{total}: {file_path.name}")
+
+                archive_info = sorter.inspect_archive(file_path)
+                if archive_info.inspected and archive_info.supported:
+                    self.signals.log.emit(
+                        f"[archive] {archive_info.archive_type}: просмотрено {archive_info.entries_scanned}"
+                    )
+
+                recommendations = sorter.ask_llm(
+                    file_path,
+                    tree_str,
+                    flat_paths,
+                    archive_info=archive_info,
+                ) or []
+
+                if self.cancelled:
+                    cancelled = True
+                    break
+                if self.skip_requested:
+                    self.signals.log.emit(f"[skip] {file_path.name}")
+                    self.signals.file_done.emit("skipped")
+                    self.signals.progress.emit(index, total)
+                    continue
+
+                self.signals.recommendations_ready.emit(file_path, recommendations)
+                self.signals.status.emit("Выберите папку или пропустите файл.")
+                action = self.wait_for_action()
+
+                if self.cancelled or action is None:
+                    cancelled = True
+                    break
+                if action.get("type") == "skip":
+                    self.signals.log.emit(f"[skip] {file_path.name}")
+                    self.signals.file_done.emit("skipped")
+                    self.signals.progress.emit(index, total)
+                    continue
+                if action.get("type") == "move":
+                    try:
+                        destination = self.move_to_folder(file_path, str(action.get("folder", "")))
+                        self.signals.log.emit(f"[move] {file_path.name} -> {destination}")
+                        self.signals.file_done.emit("moved")
+                    except Exception as e:
+                        self.signals.log.emit(f"[move:error] {file_path.name}: {e}")
+                        self.signals.error.emit(str(e))
+                        self.signals.file_done.emit("error")
+
+                self.signals.progress.emit(index, total)
+
+            self.signals.status.emit("Отменено." if cancelled else "Готово.")
+            self.signals.finished.emit(cancelled)
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+            self.signals.finished.emit(False)
+
+
 class SmartMoveTab(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        info = QLabel(
-            "Умный перенос будет подключен следующим этапом: файл по одному, 1-5 рекомендаций, "
-            "таймер автовыбора, история операций."
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
+        self.thread_pool = QThreadPool.globalInstance()
+        self.worker: SmartMoveWorker | None = None
+        self.current_recommendations: list[dict] = []
+        self.current_file: Path | None = None
+        self.setup_ui()
 
-        settings = QGroupBox("LLM defaults")
-        form = QFormLayout(settings)
-        self.url_edit = QLineEdit(sorter.LLAMACPP_URL)
-        self.model_edit = QLineEdit(sorter.MODEL_NAME)
-        self.timeout_spin = QSpinBox()
-        self.timeout_spin.setRange(1, 600)
-        self.timeout_spin.setValue(10)
-        self.temp_spin = QSpinBox()
-        self.temp_spin.setRange(0, 100)
-        self.temp_spin.setValue(30)
-        self.max_tokens_spin = QSpinBox()
-        self.max_tokens_spin.setRange(1024, 262144)
-        self.max_tokens_spin.setSingleStep(1024)
-        self.max_tokens_spin.setValue(32768)
-        form.addRow("URL", self.url_edit)
-        form.addRow("Model", self.model_edit)
-        form.addRow("Timeout, sec", self.timeout_spin)
-        form.addRow("Temperature x100", self.temp_spin)
-        form.addRow("Max tokens", self.max_tokens_spin)
-        layout.addWidget(settings)
-        layout.addStretch(1)
+    def setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Умная сортировка файлов")
+        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        layout.addWidget(title)
+
+        help_text = QLabel(
+            "1) Выберите источник и папку назначения. 2) Настройте фильтр расширений и сортировку. "
+            "3) Запустите анализ: для каждого файла можно переместить, пропустить или отменить процесс."
+        )
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+
+        paths_box = QGroupBox("Папки")
+        paths_form = QFormLayout(paths_box)
+        self.root_edit = QLineEdit()
+        self.root_edit.setPlaceholderText("Например: C:/Users/Name/Downloads")
+        self.dest_edit = QLineEdit()
+        self.dest_edit.setPlaceholderText("Например: F:/3D/UE")
+        root_row = QHBoxLayout()
+        root_row.addWidget(self.root_edit, 1)
+        root_browse = QPushButton("Выбрать...")
+        root_browse.clicked.connect(lambda: self.choose_folder(self.root_edit, "Выбрать источник"))
+        root_row.addWidget(root_browse)
+        dest_row = QHBoxLayout()
+        dest_row.addWidget(self.dest_edit, 1)
+        dest_browse = QPushButton("Выбрать...")
+        dest_browse.clicked.connect(lambda: self.choose_folder(self.dest_edit, "Выбрать назначение"))
+        dest_row.addWidget(dest_browse)
+        paths_form.addRow("Источник root", root_row)
+        paths_form.addRow("Назначение dest", dest_row)
+        layout.addWidget(paths_box)
+
+        options_box = QGroupBox("Фильтр и порядок")
+        options_layout = QHBoxLayout(options_box)
+        self.ext_edit = QLineEdit()
+        self.ext_edit.setPlaceholderText("Пусто = все файлы; пример: .zip .rar .7z")
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("Имя A→Z", "name")
+        self.sort_combo.addItem("Размер: большие первые", "size")
+        self.sort_combo.addItem("Дата: новые первые", "date")
+        self.sort_combo.addItem("Без сортировки", "none")
+        options_layout.addWidget(QLabel("Расширения:"))
+        options_layout.addWidget(self.ext_edit, 1)
+        options_layout.addWidget(QLabel("Сортировка:"))
+        options_layout.addWidget(self.sort_combo)
+        layout.addWidget(options_box)
+
+        controls = QHBoxLayout()
+        self.start_btn = QPushButton("Старт")
+        self.start_btn.clicked.connect(self.start)
+        self.cancel_btn = QPushButton("Отмена")
+        self.cancel_btn.clicked.connect(self.cancel)
+        self.skip_btn = QPushButton("Пропустить файл")
+        self.skip_btn.clicked.connect(self.skip_current)
+        self.cancel_btn.setEnabled(False)
+        self.skip_btn.setEnabled(False)
+        controls.addWidget(self.start_btn)
+        controls.addWidget(self.skip_btn)
+        controls.addWidget(self.cancel_btn)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        progress_row = QHBoxLayout()
+        self.progress = QProgressBar()
+        self.progress.setFormat("%v / %m")
+        self.status_label = QLabel("Готов к запуску.")
+        progress_row.addWidget(self.progress, 1)
+        progress_row.addWidget(self.status_label, 2)
+        layout.addLayout(progress_row)
+
+        current_box = QGroupBox("Текущий файл")
+        current_layout = QVBoxLayout(current_box)
+        self.current_label = QLabel("Файл не выбран")
+        self.current_label.setWordWrap(True)
+        current_layout.addWidget(self.current_label)
+        layout.addWidget(current_box)
+
+        splitter = QSplitter(Qt.Vertical)
+        recommendations_widget = QWidget()
+        recommendations_layout = QVBoxLayout(recommendations_widget)
+        self.recommendations_table = QTableWidget(0, 4)
+        self.recommendations_table.setHorizontalHeaderLabels(["#", "Папка", "Уверенность", "Причина"])
+        self.recommendations_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.recommendations_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.recommendations_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.recommendations_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.recommendations_table.itemSelectionChanged.connect(self.sync_custom_folder_from_selection)
+        recommendations_layout.addWidget(self.recommendations_table)
+
+        move_row = QHBoxLayout()
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setPlaceholderText("Выбранная или новая папка относительно dest")
+        self.move_btn = QPushButton("Переместить в эту папку")
+        self.move_btn.clicked.connect(self.move_current)
+        self.move_btn.setEnabled(False)
+        move_row.addWidget(QLabel("Папка:"))
+        move_row.addWidget(self.folder_edit, 1)
+        move_row.addWidget(self.move_btn)
+        recommendations_layout.addLayout(move_row)
+        splitter.addWidget(recommendations_widget)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(1500)
+        splitter.addWidget(self.log)
+        splitter.setSizes([500, 180])
+        layout.addWidget(splitter, 1)
+
+    def choose_folder(self, target: QLineEdit, title: str) -> None:
+        initial = target.text().strip() or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, title, initial)
+        if folder:
+            target.setText(folder)
+
+    def parse_extensions(self) -> set[str]:
+        result: set[str] = set()
+        for raw in self.ext_edit.text().replace(",", " ").split():
+            ext = raw.strip().lower()
+            if not ext:
+                continue
+            if not ext.startswith("."):
+                ext = "." + ext
+            result.add(ext)
+        return result
+
+    def set_running(self, running: bool) -> None:
+        self.start_btn.setEnabled(not running)
+        self.cancel_btn.setEnabled(running)
+        self.skip_btn.setEnabled(running)
+        self.move_btn.setEnabled(False)
+        self.root_edit.setEnabled(not running)
+        self.dest_edit.setEnabled(not running)
+        self.ext_edit.setEnabled(not running)
+        self.sort_combo.setEnabled(not running)
+
+    def log_line(self, text: str) -> None:
+        self.log.appendPlainText(text)
+
+    def start(self) -> None:
+        root = Path(self.root_edit.text().strip())
+        dest = Path(self.dest_edit.text().strip())
+        if not root.is_dir():
+            QMessageBox.warning(self, "Источник недоступен", f"Папка не существует:\n{root}")
+            return
+        if not dest.is_dir():
+            QMessageBox.warning(self, "Назначение недоступно", f"Папка не существует:\n{dest}")
+            return
+
+        self.current_file = None
+        self.current_recommendations = []
+        self.recommendations_table.setRowCount(0)
+        self.folder_edit.clear()
+        self.log.clear()
+        self.progress.setValue(0)
+        self.status_label.setText("Запуск...")
+        self.current_label.setText("Файл не выбран")
+        self.set_running(True)
+
+        self.worker = SmartMoveWorker(
+            root=root,
+            dest=dest,
+            include_extensions=self.parse_extensions(),
+            sort_by=str(self.sort_combo.currentData()),
+        )
+        self.worker.signals.log.connect(self.log_line)
+        self.worker.signals.status.connect(self.status_label.setText)
+        self.worker.signals.progress.connect(self.on_progress)
+        self.worker.signals.file_started.connect(self.on_file_started)
+        self.worker.signals.recommendations_ready.connect(self.on_recommendations_ready)
+        self.worker.signals.file_done.connect(self.on_file_done)
+        self.worker.signals.error.connect(self.on_error)
+        self.worker.signals.finished.connect(self.on_finished)
+        self.thread_pool.start(self.worker)
+
+    def cancel(self) -> None:
+        if self.worker:
+            self.worker.cancel()
+            self.status_label.setText("Отмена запрошена. Жду завершения текущего LLM-запроса...")
+            self.log_line("[ui] Отмена запрошена.")
+        self.cancel_btn.setEnabled(False)
+        self.skip_btn.setEnabled(False)
+        self.move_btn.setEnabled(False)
+
+    def skip_current(self) -> None:
+        if self.worker:
+            self.worker.skip_current()
+            self.status_label.setText("Пропуск запрошен...")
+            self.log_line("[ui] Пропуск текущего файла.")
+        self.move_btn.setEnabled(False)
+
+    def move_current(self) -> None:
+        folder = self.folder_edit.text().strip()
+        if not folder:
+            QMessageBox.warning(self, "Папка не выбрана", "Выберите рекомендацию или введите папку вручную.")
+            return
+        if self.worker:
+            self.move_btn.setEnabled(False)
+            self.skip_btn.setEnabled(False)
+            self.worker.choose_folder(folder)
+            self.status_label.setText("Перемещение...")
+
+    def on_progress(self, value: int, total: int) -> None:
+        self.progress.setRange(0, max(total, 1))
+        self.progress.setValue(value)
+
+    def on_file_started(self, info: dict) -> None:
+        self.current_file = info["path"]
+        self.recommendations_table.setRowCount(0)
+        self.folder_edit.clear()
+        self.move_btn.setEnabled(False)
+        self.skip_btn.setEnabled(True)
+        self.current_label.setText(
+            f"{info['index']} / {info['total']}  •  {info['name']}  •  {info['size']}"
+        )
+
+    def on_recommendations_ready(self, file_path: Path, recommendations: list[dict]) -> None:
+        self.current_file = file_path
+        self.current_recommendations = recommendations
+        self.recommendations_table.setRowCount(len(recommendations))
+        for row, recommendation in enumerate(recommendations):
+            values = [
+                str(row + 1),
+                str(recommendation.get("folder", "")),
+                f"{float(recommendation.get('confidence', 0.0)):.0%}",
+                str(recommendation.get("reason", "")),
+            ]
+            for col, value in enumerate(values):
+                self.recommendations_table.setItem(row, col, QTableWidgetItem(value))
+        if recommendations:
+            self.recommendations_table.selectRow(0)
+            self.folder_edit.setText(str(recommendations[0].get("folder", "")))
+        self.move_btn.setEnabled(True)
+        self.skip_btn.setEnabled(True)
+
+    def sync_custom_folder_from_selection(self) -> None:
+        row = self.recommendations_table.currentRow()
+        if 0 <= row < len(self.current_recommendations):
+            self.folder_edit.setText(str(self.current_recommendations[row].get("folder", "")))
+
+    def on_file_done(self, status: str) -> None:
+        if status in {"moved", "skipped"}:
+            self.recommendations_table.setRowCount(0)
+            self.folder_edit.clear()
+            self.move_btn.setEnabled(False)
+            self.skip_btn.setEnabled(True)
+
+    def on_error(self, text: str) -> None:
+        self.log_line(text)
+        QMessageBox.warning(self, "Ошибка", text[:3000])
+        self.move_btn.setEnabled(True)
+        self.skip_btn.setEnabled(True)
+
+    def on_finished(self, cancelled: bool) -> None:
+        self.set_running(False)
+        self.worker = None
+        self.status_label.setText("Отменено." if cancelled else "Готово.")
+        self.log_line("[ui] Отменено." if cancelled else "[ui] Готово.")
 
 
 class MainWindow(QMainWindow):
@@ -657,10 +1081,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("File Sorter Assistant GUI")
         self.resize(1280, 820)
         self.tabs = QTabWidget()
-        self.duplicates_tab = DuplicateReviewTab()
         self.smart_move_tab = SmartMoveTab()
+        self.duplicates_tab = DuplicateReviewTab()
+        self.tabs.addTab(self.smart_move_tab, "Сортировка")
         self.tabs.addTab(self.duplicates_tab, "Дубликаты")
-        self.tabs.addTab(self.smart_move_tab, "Умный перенос")
         self.setCentralWidget(self.tabs)
         self.setup_toolbar()
         self.load_ini()
@@ -684,9 +1108,21 @@ class MainWindow(QMainWindow):
         config = configparser.ConfigParser()
         config.read(config_path, encoding="utf-8")
         root = config.get("paths", "root", fallback="")
+        dest = config.get("paths", "dest", fallback="")
+        include_extensions = config.get("settings", "include_extensions", fallback="")
+        sort_by = config.get("settings", "sort_by", fallback="name")
+        duplicate_depth = config.getint(GUI_CONFIG_SECTION, "duplicate_depth", fallback=0)
 
         if root:
             self.duplicates_tab.root_edit.setText(root)
+            self.smart_move_tab.root_edit.setText(root)
+        if dest:
+            self.smart_move_tab.dest_edit.setText(dest)
+        self.smart_move_tab.ext_edit.setText(include_extensions)
+        index = self.smart_move_tab.sort_combo.findData(sort_by)
+        if index >= 0:
+            self.smart_move_tab.sort_combo.setCurrentIndex(index)
+        self.duplicates_tab.depth_spin.setValue(duplicate_depth)
 
     def save_ini(self) -> None:
         config_path = sorter.CONFIG_PATH
@@ -698,17 +1134,20 @@ class MainWindow(QMainWindow):
         if not config.has_section("paths"):
             config.add_section("paths")
 
-        config.set("paths", "root", self.duplicates_tab.root_edit.text().strip())
+        root_value = self.smart_move_tab.root_edit.text().strip() or self.duplicates_tab.root_edit.text().strip()
+        config.set("paths", "root", root_value)
+        config.set("paths", "dest", self.smart_move_tab.dest_edit.text().strip())
+
+        if not config.has_section("settings"):
+            config.add_section("settings")
+
+        config.set("settings", "include_extensions", " ".join(sorted(self.smart_move_tab.parse_extensions())))
+        config.set("settings", "sort_by", str(self.smart_move_tab.sort_combo.currentData()))
 
         if not config.has_section(GUI_CONFIG_SECTION):
             config.add_section(GUI_CONFIG_SECTION)
 
         config.set(GUI_CONFIG_SECTION, "duplicate_depth", str(self.duplicates_tab.depth_spin.value()))
-        config.set(GUI_CONFIG_SECTION, "llm_url", self.smart_move_tab.url_edit.text().strip())
-        config.set(GUI_CONFIG_SECTION, "llm_model", self.smart_move_tab.model_edit.text().strip())
-        config.set(GUI_CONFIG_SECTION, "llm_timeout", str(self.smart_move_tab.timeout_spin.value()))
-        config.set(GUI_CONFIG_SECTION, "llm_temperature", str(self.smart_move_tab.temp_spin.value() / 100.0))
-        config.set(GUI_CONFIG_SECTION, "llm_max_tokens", str(self.smart_move_tab.max_tokens_spin.value()))
 
         with config_path.open("w", encoding="utf-8") as f:
             config.write(f)
