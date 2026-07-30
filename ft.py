@@ -13,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 FORMAT_PREFIX = "FTPKG1"
@@ -85,7 +86,9 @@ def build_token(source):
     payload_hash = sha256_bytes(payload)
 
     encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
-    return "{}.{}.{}".format(FORMAT_PREFIX, encoded, payload_hash)
+    token = "{}.{}.{}".format(FORMAT_PREFIX, encoded, payload_hash)
+    timestamp = time.strftime("%H%M%S")
+    return "{}-{}".format(timestamp, token)
 
 
 def extract_token_from_text(text):
@@ -98,6 +101,8 @@ def extract_token_from_text(text):
 
 def decode_token(token):
     compact = normalize_text(token)
+    if re.match(r"^\d{6}-", compact):
+        compact = compact[7:]
     parts = compact.split(".")
     if len(parts) != 3:
         raise ValueError("Неверный формат пакета")
@@ -338,85 +343,231 @@ def launch_web(port=5000):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>FT Transfer — Web Interface</title>
+        <title>FT Transfer</title>
         <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f5f7; margin: 0; padding: 40px; color: #333; }
-            .container { max-width: 700px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
-            h1 { font-size: 22px; border-bottom: 2px solid #0052cc; padding-bottom: 10px; margin-top: 0; }
-            .section { margin-top: 30px; padding: 20px; background: #fafbfc; border: 1px solid #dfe1e6; border-radius: 6px; }
-            h2 { font-size: 16px; margin-top: 0; color: #172b4d; }
-            .form-group { margin-bottom: 15px; padding-bottom: 15px; border-bottom: 1px dashed #dfe1e6; }
-            .form-group:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
-            label { display: block; font-weight: bold; margin-bottom: 8px; font-size: 13px; color: #5e6c84; text-transform: uppercase;}
-            input[type="file"], input[type="text"], textarea { width: 100%; padding: 8px; box-sizing: border-box; border: 2px solid #dfe1e6; border-radius: 4px; outline: none; transition: border 0.2s; background: #fff;}
-            input[type="file"] { padding: 5px; }
-            input[type="text"]:focus, textarea:focus { border-color: #0052cc; }
-            button { background-color: #0052cc; color: white; border: none; padding: 10px 20px; font-size: 14px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: background 0.2s; margin-top: 10px; width: 100%;}
-            button:hover { background-color: #0047b3; }
-            button:disabled { background-color: #a5b2c0; cursor: not-allowed; }
-            .btn-secondary { background-color: #6b778c; width: auto; margin-top: 0;}
-            .btn-secondary:hover { background-color: #505f79; }
-            .text-muted { color: #6b778c; font-size: 12px; margin-top: 8px; line-height: 1.4; }
-            .result-box { margin-top: 15px; padding: 15px; border-radius: 4px; display: none; }
-            .result-box.success { background-color: #e3fcef; border: 1px solid #36b37e; color: #006644; }
-            .result-box.error { background-color: #ffebe6; border: 1px solid #ff5630; color: #bf2600; }
-            .flex-actions { display: flex; gap: 8px; margin-top: 8px;}
-            .loader { display: none; text-align: center; font-size: 13px; color: #0052cc; font-weight: bold; margin-top: 10px; }
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+                background: linear-gradient(135deg, #e8ecf1 0%, #d5dbe3 100%);
+                min-height: 100vh; padding: 32px 16px; color: #1a1a2e;
+            }
+            .wrapper { max-width: 680px; margin: 0 auto; }
+
+            .header { text-align: center; margin-bottom: 28px; }
+            .header h1 { font-size: 26px; font-weight: 700; color: #0d1b3e; letter-spacing: -0.5px; }
+            .header .subtitle { font-size: 13px; color: #6b7a90; margin-top: 6px; }
+
+            .auto-toggle {
+                display: flex; align-items: center; gap: 8px; justify-content: center;
+                margin-bottom: 20px; padding: 10px 16px; background: #fff;
+                border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+                font-size: 13px; color: #3d4f6f;
+            }
+            .auto-toggle input[type="checkbox"] { accent-color: #2563eb; width: 16px; height: 16px; }
+
+            .tabs {
+                display: flex; gap: 0; margin-bottom: -1px; position: relative; z-index: 1;
+            }
+            .tab-btn {
+                flex: 1; padding: 14px 0; font-size: 15px; font-weight: 600;
+                text-align: center; border: none; border-radius: 12px 12px 0 0;
+                cursor: pointer; transition: all 0.2s;
+                background: #dce1e8; color: #6b7a90;
+            }
+            .tab-btn.active { background: #fff; color: #0d1b3e; box-shadow: 0 -2px 8px rgba(0,0,0,0.04); }
+            .tab-btn:not(.active):hover { background: #d0d7e0; }
+
+            .card {
+                background: #fff; border-radius: 0 0 12px 12px;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.06); padding: 28px;
+            }
+            .tab-content { display: none; }
+            .tab-content.active { display: block; }
+
+            .field { margin-bottom: 20px; }
+            .field:last-child { margin-bottom: 0; }
+            .field-label {
+                display: block; font-size: 12px; font-weight: 600;
+                color: #6b7a90; text-transform: uppercase; letter-spacing: 0.5px;
+                margin-bottom: 8px;
+            }
+            .field-hint { font-size: 11px; color: #8e9bb5; margin-top: 6px; }
+
+            input[type="file"], input[type="text"], textarea {
+                width: 100%; padding: 10px 12px; border: 2px solid #e2e7ee;
+                border-radius: 8px; font-size: 14px; outline: none;
+                transition: border-color 0.2s, box-shadow 0.2s; background: #f9fafb;
+                font-family: inherit;
+            }
+            input[type="file"] { padding: 8px; background: #fff; }
+            input[type="text"]:focus, textarea:focus {
+                border-color: #2563eb; background: #fff;
+                box-shadow: 0 0 0 3px rgba(37,99,235,0.08);
+            }
+            textarea { resize: vertical; font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; font-size: 13px; line-height: 1.5; }
+
+            .btn-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+            .btn-primary {
+                flex: 1; padding: 12px 20px; font-size: 14px; font-weight: 600;
+                border: none; border-radius: 8px; cursor: pointer; transition: all 0.2s;
+                background: #2563eb; color: #fff;
+            }
+            .btn-primary:hover { background: #1d4ed8; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(37,99,235,0.25); }
+            .btn-primary:active { transform: translateY(0); }
+            .btn-primary:disabled { background: #a3b8d0; cursor: not-allowed; transform: none; box-shadow: none; }
+
+            .btn-ghost {
+                padding: 10px 16px; font-size: 13px; font-weight: 500;
+                border: 2px solid #e2e7ee; border-radius: 8px; cursor: pointer;
+                background: #fff; color: #3d4f6f; transition: all 0.2s;
+            }
+            .btn-ghost:hover { border-color: #2563eb; color: #2563eb; background: #f0f5ff; }
+
+            .btn-paste {
+                display: inline-flex; align-items: center; gap: 5px;
+                padding: 7px 14px; font-size: 12px; font-weight: 500;
+                border: 1px solid #d0d7e0; border-radius: 6px; cursor: pointer;
+                background: #f0f4f8; color: #4a5568; transition: all 0.15s;
+            }
+            .btn-paste:hover { background: #e2e8f0; border-color: #a0aec0; }
+            .btn-paste.pasted { background: #dcfce7; border-color: #86efac; color: #166534; }
+
+            .paste-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+
+            .result-box {
+                margin-top: 16px; padding: 16px; border-radius: 10px;
+                display: none; font-size: 13px; line-height: 1.6;
+            }
+            .result-box.success { background: #ecfdf5; border: 1px solid #a7f3d0; color: #065f46; }
+            .result-box.error { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }
+
+            .flex-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+
+            .loader {
+                display: none; text-align: center; padding: 16px 0;
+                font-size: 13px; color: #2563eb; font-weight: 500;
+            }
+            .loader::before {
+                content: ''; display: inline-block; width: 16px; height: 16px;
+                border: 2px solid #bfdbfe; border-top-color: #2563eb;
+                border-radius: 50%; animation: spin 0.7s linear infinite;
+                vertical-align: middle; margin-right: 8px;
+            }
+            @keyframes spin { to { transform: rotate(360deg); } }
+
+            .divider { border: none; border-top: 1px dashed #e2e7ee; margin: 16px 0; }
+
+            .token-display {
+                width: 100%; padding: 12px; font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+                font-size: 12px; line-height: 1.5; border: 2px solid #e2e7ee; border-radius: 8px;
+                background: #f8fafc; resize: vertical; cursor: text;
+            }
         </style>
     </head>
     <body>
-        <div class="container">
-            <h1>FT Transfer</h1>
-            
-            <div style="margin: 15px 0; padding: 12px; background: #f0f4ff; border-radius: 6px; border: 1px solid #d0d9f0;">
-                <label style="display: flex; align-items: center; gap: 8px; margin: 0; font-size: 13px; text-transform: none; color: #172b4d;">
-                    <input type="checkbox" id="autoMode" checked> Автоматический режим: распознавание при вставке
-                </label>
-            </div>
-            
-            <div class="section">
-                <h2>Упаковка (Pack)</h2>
-                
-                <div class="form-group">
-                    <label>Вариант 1: Выбрать один файл</label>
-                    <input type="file" id="packFile" onchange="clearOthers('packFile')">
-                </div>
-                
-                <div class="form-group">
-                    <label>Вариант 2: Выбрать папку целиком</label>
-                    <input type="file" id="packFolder" webkitdirectory directory onchange="clearOthers('packFolder')">
-                    <div class="text-muted">Для больших папок (сотни мегабайт) используйте консольную версию.</div>
-                </div>
-                
-                <div class="form-group">
-                    <label>Вариант 3: Вставить текст как .txt файл</label>
-                    <input type="text" id="packTextName" placeholder="Имя файла (например: config.json)" style="margin-bottom: 8px;" oninput="clearOthers('packTextContent')">
-                    <textarea id="packTextContent" rows="4" placeholder="Вставь исходный текст..." oninput="clearOthers('packTextContent')"></textarea>
-                </div>
-
-                <button id="btnPack" onclick="handlePack()">Сгенерировать токен</button>
-                <div id="packLoader" class="loader">Сборка и упаковка данных, подождите...</div>
-                <div id="packResult" class="result-box"></div>
+        <div class="wrapper">
+            <div class="header">
+                <h1>FT Transfer</h1>
+                <div class="subtitle">Упаковка файлов и текста в токены и обратно</div>
             </div>
 
-            <div class="section">
-                <h2>Распаковка (Unpack)</h2>
-                <div class="form-group">
-                    <label>Вариант 1: Загрузить файл токена (.ft.txt)</label>
-                    <input type="file" id="unpackFile" onchange="document.getElementById('unpackText').value = '';">
+            <div class="auto-toggle">
+                <input type="checkbox" id="autoMode" checked>
+                <label for="autoMode">Авто-режим: распознавание при вставке</label>
+            </div>
+
+            <div class="tabs">
+                <button class="tab-btn active" onclick="switchTab('pack')">Упаковать</button>
+                <button class="tab-btn" onclick="switchTab('unpack')">Распаковать</button>
+            </div>
+            <div class="card">
+
+                <!-- ==================== PACK TAB ==================== -->
+                <div id="tab-pack" class="tab-content active">
+                    <div class="field">
+                        <span class="field-label">Файл</span>
+                        <input type="file" id="packFile" onchange="clearOthers('packFile')">
+                    </div>
+
+                    <div class="field">
+                        <span class="field-label">Папка</span>
+                        <input type="file" id="packFolder" webkitdirectory directory onchange="clearOthers('packFolder')">
+                        <div class="field-hint">Для больших папок (100+ MB) используйте CLI.</div>
+                    </div>
+
+                    <hr class="divider">
+
+                    <div class="field">
+                        <span class="field-label">Или текст</span>
+                        <div class="paste-row">
+                            <input type="text" id="packTextName" placeholder="Имя файла (config.json)" style="flex:1;" oninput="clearOthers('packTextContent')">
+                            <button class="btn-paste" onclick="pasteClipboard('packTextContent', this)" title="Вставить из буфера">&#128203; Вставить</button>
+                        </div>
+                        <textarea id="packTextContent" rows="5" placeholder="Вставьте исходный текст..." oninput="clearOthers('packTextContent')"></textarea>
+                    </div>
+
+                    <div class="btn-row">
+                        <button class="btn-primary" id="btnPack" onclick="handlePack()">Сгенерировать токен</button>
+                    </div>
+                    <div id="packLoader" class="loader">Сборка и упаковка данных...</div>
+                    <div id="packResult" class="result-box"></div>
                 </div>
-                <div class="form-group">
-                    <label>Вариант 2: Вставить сырой токен FTPKG1...</label>
-                    <textarea id="unpackText" rows="5" placeholder="FTPKG1..." oninput="document.getElementById('unpackFile').value = '';"></textarea>
+
+                <!-- ==================== UNPACK TAB ==================== -->
+                <div id="tab-unpack" class="tab-content">
+                    <div class="field">
+                        <span class="field-label">Файл токена (.ft.txt)</span>
+                        <input type="file" id="unpackFile" onchange="document.getElementById('unpackText').value = '';">
+                    </div>
+
+                    <hr class="divider">
+
+                    <div class="field">
+                        <span class="field-label">Или вставьте токен</span>
+                        <div class="paste-row">
+                            <button class="btn-paste" onclick="pasteClipboard('unpackText', this)" title="Вставить токен из буфера">&#128203; Вставить токен</button>
+                        </div>
+                        <textarea id="unpackText" rows="6" placeholder="HHMMSS-FTPKG1..." oninput="document.getElementById('unpackFile').value = '';"></textarea>
+                    </div>
+
+                    <div class="btn-row">
+                        <button class="btn-primary" id="btnUnpack" onclick="handleUnpack()">Распаковать</button>
+                    </div>
+                    <div class="field-hint" style="margin-top: 8px;">Распаковка на сервере в папку <b>./restored</b>.</div>
+                    <div id="unpackLoader" class="loader">Распаковка данных...</div>
+                    <div id="unpackResult" class="result-box"></div>
                 </div>
-                <button id="btnUnpack" onclick="handleUnpack()">Распаковать на сервере</button>
-                <p class="text-muted">Распаковка происходит локально на стороне сервера в директорию <b>./restored</b>.</p>
-                <div id="unpackLoader" class="loader">Распаковка данных, подождите...</div>
-                <div id="unpackResult" class="result-box"></div>
             </div>
         </div>
 
         <script>
+            /* ===== Tab switching ===== */
+            function switchTab(name) {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                document.getElementById('tab-' + name).classList.add('active');
+                const btns = document.querySelectorAll('.tab-btn');
+                btns[name === 'pack' ? 0 : 1].classList.add('active');
+            }
+
+            /* ===== Clipboard paste ===== */
+            async function pasteClipboard(targetId, btn) {
+                try {
+                    const text = await navigator.clipboard.readText();
+                    if (!text) return;
+                    document.getElementById(targetId).value = text;
+                    if (btn) {
+                        btn.classList.add('pasted');
+                        btn.innerHTML = '&#10003; Вставлено';
+                        setTimeout(() => { btn.classList.remove('pasted'); btn.innerHTML = '&#128203; ' + (targetId === 'unpackText' ? 'Вставить токен' : 'Вставить'); }, 1500);
+                    }
+                    document.getElementById(targetId).dispatchEvent(new Event('input'));
+                } catch (err) {
+                    alert('Не удалось прочитать буфер обмена. Разрешите доступ к Clipboard API или вставьте вручную (Ctrl+V).');
+                }
+            }
+
+            /* ===== Clear helpers ===== */
             function clearOthers(activeId) {
                 if (activeId !== 'packFile') document.getElementById('packFile').value = '';
                 if (activeId !== 'packFolder') document.getElementById('packFolder').value = '';
@@ -428,43 +579,35 @@ def launch_web(port=5000):
 
             function showResult(elementId, type, message) {
                 const el = document.getElementById(elementId);
-                el.className = `result-box ${type}`;
+                el.className = 'result-box ' + type;
                 el.innerHTML = message;
-                el.style.display = 'block'; // Жесткий оверрайд inline-стиля
+                el.style.display = 'block';
             }
 
+            /* ===== Copy / Download ===== */
             window.currentExportToken = '';
             window.currentExportFilename = '';
 
             window.copyTextElement = async function(btn, elementId) {
                 const ta = document.getElementById(elementId);
-                try {
-                    await navigator.clipboard.writeText(ta.value);
-                } catch (err) {
-                    ta.select();
-                    document.execCommand('copy');
-                }
-                const originalText = btn.innerText;
+                try { await navigator.clipboard.writeText(ta.value); }
+                catch (err) { ta.select(); document.execCommand('copy'); }
+                const orig = btn.innerText;
                 btn.innerText = 'Скопировано!';
-                btn.style.backgroundColor = '#36b37e';
-                setTimeout(() => {
-                    btn.innerText = originalText;
-                    btn.style.backgroundColor = '#6b778c';
-                }, 2000);
+                btn.style.background = '#dcfce7'; btn.style.color = '#166534'; btn.style.borderColor = '#86efac';
+                setTimeout(() => { btn.innerText = orig; btn.style.background = ''; btn.style.color = ''; btn.style.borderColor = ''; }, 1500);
             };
 
             window.downloadOutToken = function() {
                 const blob = new Blob([window.currentExportToken], { type: 'text/plain' });
-                const url = window.URL.createObjectURL(blob);
+                const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
-                a.href = url;
-                a.download = window.currentExportFilename + '.ft.txt';
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                window.URL.revokeObjectURL(url);
+                a.href = url; a.download = window.currentExportFilename + '.ft.txt';
+                document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                URL.revokeObjectURL(url);
             };
 
+            /* ===== Pack ===== */
             async function handlePack() {
                 const btn = document.getElementById('btnPack');
                 const loader = document.getElementById('packLoader');
@@ -472,149 +615,106 @@ def launch_web(port=5000):
                 const folderInput = document.getElementById('packFolder');
                 const textContent = document.getElementById('packTextContent').value.trim();
                 const textName = document.getElementById('packTextName').value.trim();
-                
-                btn.disabled = true;
-                loader.style.display = 'block';
+
+                btn.disabled = true; loader.style.display = 'block';
                 document.getElementById('packResult').style.display = 'none';
 
                 try {
                     let payload = {};
-                    
+
                     if (fileInput.files.length > 0) {
                         const file = fileInput.files[0];
                         const base64 = await new Promise((resolve, reject) => {
-                            const reader = new FileReader();
-                            reader.onload = e => {
-                                const b64Part = e.target.result.split(',')[1];
-                                resolve(b64Part ? b64Part : '');
-                            };
-                            reader.onerror = () => reject(new Error("Ошибка чтения файла"));
-                            reader.readAsDataURL(file);
+                            const r = new FileReader();
+                            r.onload = e => { const b = e.target.result.split(',')[1]; resolve(b ? b : ''); };
+                            r.onerror = () => reject(new Error("Ошибка чтения файла"));
+                            r.readAsDataURL(file);
                         });
                         payload = { is_folder: false, is_text: false, filename: file.name, content_b64: base64 };
-                    } 
+                    }
                     else if (folderInput.files.length > 0) {
                         const files = folderInput.files;
                         const folderName = files[0].webkitRelativePath ? files[0].webkitRelativePath.split('/')[0] : 'packed_folder';
-                        
-                        const filePromises = Array.from(files).map(file => {
-                            return new Promise((resolve, reject) => {
-                                const reader = new FileReader();
-                                reader.onload = e => {
-                                    const b64Part = e.target.result.split(',')[1];
-                                    resolve({
-                                        path: file.webkitRelativePath || file.name,
-                                        b64: b64Part ? b64Part : ''
-                                    });
-                                };
-                                reader.onerror = () => reject(new Error(`Ошибка чтения ${file.name}`));
-                                reader.readAsDataURL(file);
-                            });
-                        });
-                        
-                        const fileData = await Promise.all(filePromises);
+                        const fileData = await Promise.all(Array.from(files).map(file => new Promise((resolve, reject) => {
+                            const r = new FileReader();
+                            r.onload = e => { const b = e.target.result.split(',')[1]; resolve({ path: file.webkitRelativePath || file.name, b64: b ? b : '' }); };
+                            r.onerror = () => reject(new Error("Ошибка чтения " + file.name));
+                            r.readAsDataURL(file);
+                        })));
                         payload = { is_folder: true, folder_name: folderName, files: fileData };
                     }
                     else if (textContent) {
                         payload = { is_folder: false, is_text: true, filename: textName || 'pasted_text.txt', text_content: textContent };
-                    } 
-                    else {
-                        throw new Error('Выберите файл, папку или вставьте текст.');
                     }
+                    else { throw new Error('Выберите файл, папку или вставьте текст.'); }
 
-                    const res = await fetch('/api/pack', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-                    
+                    const res = await fetch('/api/pack', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
                     const data = await res.json();
                     if (data.error) throw new Error(data.error);
 
                     window.currentExportToken = data.token;
                     window.currentExportFilename = data.filename;
 
-                    const successHtml = `
-                        <div style="margin-bottom: 10px; font-weight: bold; color: #006644;">Токен успешно сгенерирован (${data.filename}):</div>
-                        <textarea id="outTokenArea" rows="6" readonly style="width: 100%; margin-bottom: 10px; font-family: monospace; cursor: text;"></textarea>
-                        <div class="flex-actions">
-                            <button class="btn-secondary" onclick="copyTextElement(this, 'outTokenArea')">Скопировать токен</button>
-                            <button class="btn-secondary" onclick="downloadOutToken()">Скачать .ft.txt</button>
-                        </div>
-                    `;
-                    showResult('packResult', 'success', successHtml);
+                    showResult('packResult', 'success',
+                        '<div style="margin-bottom:10px;font-weight:600;">Токен (' + data.filename + '):</div>' +
+                        '<textarea id="outTokenArea" class="token-display" rows="6" readonly></textarea>' +
+                        '<div class="flex-actions">' +
+                            '<button class="btn-ghost" onclick="copyTextElement(this, \'outTokenArea\')">Копировать</button>' +
+                            '<button class="btn-ghost" onclick="downloadOutToken()">Скачать .ft.txt</button>' +
+                        '</div>'
+                    );
                     document.getElementById('outTokenArea').value = data.token;
                 } catch (err) {
                     showResult('packResult', 'error', err.message);
                 } finally {
-                    btn.disabled = false;
-                    loader.style.display = 'none';
+                    btn.disabled = false; loader.style.display = 'none';
                 }
             }
 
+            /* ===== Unpack ===== */
             async function handleUnpack() {
                 const btn = document.getElementById('btnUnpack');
                 const loader = document.getElementById('unpackLoader');
                 const fileInput = document.getElementById('unpackFile');
                 const tokenText = document.getElementById('unpackText').value.trim();
-                
-                btn.disabled = true;
-                loader.style.display = 'block';
+
+                btn.disabled = true; loader.style.display = 'block';
                 document.getElementById('unpackResult').style.display = 'none';
 
                 try {
                     let tokenPayload = "";
-
                     if (fileInput.files.length > 0) {
-                        const file = fileInput.files[0];
                         tokenPayload = await new Promise((resolve, reject) => {
-                            const reader = new FileReader();
-                            reader.onload = e => resolve(e.target.result);
-                            reader.onerror = () => reject(new Error("Ошибка чтения токена"));
-                            reader.readAsText(file);
+                            const r = new FileReader();
+                            r.onload = e => resolve(e.target.result);
+                            r.onerror = () => reject(new Error("Ошибка чтения токена"));
+                            r.readAsText(fileInput.files[0]);
                         });
-                    } else if (tokenText) {
-                        tokenPayload = tokenText;
-                    } else {
-                        throw new Error('Выберите файл токена или вставьте текст.');
-                    }
+                    } else if (tokenText) { tokenPayload = tokenText; }
+                    else { throw new Error('Выберите файл токена или вставьте текст.'); }
 
-                    const res = await fetch('/api/unpack', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ token: tokenPayload })
-                    });
-                    
+                    const res = await fetch('/api/unpack', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: tokenPayload }) });
                     const data = await res.json();
                     if (data.error) throw new Error(data.error);
-                    
-                    let resultHtml = `Данные успешно восстановлены по пути:<br><b style="color:#172b4d;">${data.path}</b>`;
-                    
+
+                    let html = 'Восстановлено: <b>' + data.path + '</b>';
                     if (data.is_text && data.text_content !== null) {
-                        const truncationNotice = data.text_truncated ? '<div class="text-muted">Предпросмотр обрезан. Полный файл сохранён на диск.</div>' : '';
-                        resultHtml += `
-                            <div style="margin-top: 15px; font-weight: bold; color: #006644;">Содержимое файла:</div>
-                            ${truncationNotice}
-                            <textarea id="unpackedContentArea" rows="10" readonly style="width: 100%; margin-top: 8px; margin-bottom: 10px; font-family: monospace; cursor: text;"></textarea>
-                            <div>
-                                <button class="btn-secondary" onclick="copyTextElement(this, 'unpackedContentArea')">Скопировать текст</button>
-                            </div>
-                        `;
-                        showResult('unpackResult', 'success', resultHtml);
+                        if (data.text_truncated) html += '<div class="field-hint">Предпросмотр обрезан. Полный файл на диске.</div>';
+                        html += '<textarea id="unpackedContentArea" class="token-display" rows="10" readonly style="margin-top:10px;"></textarea>';
+                        html += '<div class="flex-actions"><button class="btn-ghost" onclick="copyTextElement(this, \'unpackedContentArea\')">Копировать текст</button></div>';
+                        showResult('unpackResult', 'success', html);
                         document.getElementById('unpackedContentArea').value = data.text_content;
                     } else {
-                        showResult('unpackResult', 'success', resultHtml);
+                        showResult('unpackResult', 'success', html);
                     }
-
                 } catch (err) {
                     showResult('unpackResult', 'error', err.message);
                 } finally {
-                    btn.disabled = false;
-                    loader.style.display = 'none';
+                    btn.disabled = false; loader.style.display = 'none';
                 }
             }
 
-            // ===== AUTO-MODE: debounce + auto-pack + auto-unpack =====
+            /* ===== AUTO-MODE: debounce + auto-pack + auto-unpack ===== */
             function _debounce(key, ms, fn) {
                 clearTimeout(window[key]);
                 window[key] = setTimeout(fn, ms);
@@ -632,30 +732,21 @@ def launch_web(port=5000):
                 loader.style.display = 'block';
                 try {
                     const payload = { is_folder: false, is_text: true, filename: textName, text_content: textContent };
-                    const res = await fetch('/api/pack', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
+                    const res = await fetch('/api/pack', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
                     const data = await res.json();
                     if (data.error) throw new Error(data.error);
                     window.currentExportToken = data.token;
                     window.currentExportFilename = data.filename;
-                    const html = `
-                        <div style="margin-bottom: 10px; font-weight: bold; color: #006644;">Токен (${data.filename}):</div>
-                        <textarea id="outTokenArea" rows="6" readonly style="width: 100%; margin-bottom: 10px; font-family: monospace; cursor: text;"></textarea>
-                        <div class="flex-actions">
-                            <button class="btn-secondary" onclick="copyTextElement(this, 'outTokenArea')">Скопировать токен</button>
-                            <button class="btn-secondary" onclick="downloadOutToken()">Скачать .ft.txt</button>
-                        </div>
-                    `;
-                    showResult('packResult', 'success', html);
+                    showResult('packResult', 'success',
+                        '<div style="margin-bottom:10px;font-weight:600;">Токен (' + data.filename + '):</div>' +
+                        '<textarea id="outTokenArea" class="token-display" rows="6" readonly></textarea>' +
+                        '<div class="flex-actions">' +
+                            '<button class="btn-ghost" onclick="copyTextElement(this, \'outTokenArea\')">Копировать</button>' +
+                            '<button class="btn-ghost" onclick="downloadOutToken()">Скачать .ft.txt</button>' +
+                        '</div>'
+                    );
                     document.getElementById('outTokenArea').value = data.token;
-                } catch (err) {
-                    // Auto: silently ignore errors
-                } finally {
-                    loader.style.display = 'none';
-                }
+                } catch (err) { /* silent */ } finally { loader.style.display = 'none'; }
             }
 
             async function autoUnpack() {
@@ -668,42 +759,24 @@ def launch_web(port=5000):
                 const loader = document.getElementById('unpackLoader');
                 loader.style.display = 'block';
                 try {
-                    const res = await fetch('/api/unpack', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ token: tokenText })
-                    });
+                    const res = await fetch('/api/unpack', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: tokenText }) });
                     const data = await res.json();
                     if (data.error) return;
-                    let resultHtml = `Данные восстановлены:<br><b style="color:#172b4d;">${data.path}</b>`;
+                    let html = 'Восстановлено: <b>' + data.path + '</b>';
                     if (data.is_text && data.text_content !== null) {
-                        const trunc = data.text_truncated ? '<div class="text-muted">Предпросмотр обрезан.</div>' : '';
-                        resultHtml += `
-                            <div style="margin-top: 15px; font-weight: bold; color: #006644;">Содержимое:</div>
-                            ${trunc}
-                            <textarea id="unpackedContentArea" rows="10" readonly style="width: 100%; margin-top: 8px; margin-bottom: 10px; font-family: monospace; cursor: text;"></textarea>
-                            <div>
-                                <button class="btn-secondary" onclick="copyTextElement(this, 'unpackedContentArea')">Скопировать текст</button>
-                            </div>
-                        `;
-                        showResult('unpackResult', 'success', resultHtml);
+                        if (data.text_truncated) html += '<div class="field-hint">Предпросмотр обрезан.</div>';
+                        html += '<textarea id="unpackedContentArea" class="token-display" rows="10" readonly style="margin-top:10px;"></textarea>';
+                        html += '<div class="flex-actions"><button class="btn-ghost" onclick="copyTextElement(this, \'unpackedContentArea\')">Копировать текст</button></div>';
+                        showResult('unpackResult', 'success', html);
                         document.getElementById('unpackedContentArea').value = data.text_content;
                     } else {
-                        showResult('unpackResult', 'success', resultHtml);
+                        showResult('unpackResult', 'success', html);
                     }
-                } catch (err) {
-                    // Auto: silently ignore errors
-                } finally {
-                    loader.style.display = 'none';
-                }
+                } catch (err) { /* silent */ } finally { loader.style.display = 'none'; }
             }
 
-            document.getElementById('packTextContent').addEventListener('input', function() {
-                _debounce('_packAuto', 800, autoPack);
-            });
-            document.getElementById('unpackText').addEventListener('input', function() {
-                _debounce('_unpackAuto', 800, autoUnpack);
-            });
+            document.getElementById('packTextContent').addEventListener('input', function() { _debounce('_packAuto', 800, autoPack); });
+            document.getElementById('unpackText').addEventListener('input', function() { _debounce('_unpackAuto', 800, autoUnpack); });
         </script>
     </body>
     </html>
